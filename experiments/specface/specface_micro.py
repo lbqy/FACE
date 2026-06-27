@@ -33,6 +33,9 @@ class Hardware:
     noc_width_bits: int
     core_rows: int
     core_cols: int
+    core_group_rows_per_die: int
+    core_group_cols_per_die: int
+    cores_per_group: int
     instance_shape: Tuple[int, int]
     sram_bw_bytes_per_core_ns: float
 
@@ -41,8 +44,13 @@ class Hardware:
         return self.instance_shape[0] * self.instance_shape[1]
 
     @property
+    def core_group_count(self) -> int:
+        return (self.core_group_rows_per_die * self.core_group_cols_per_die *
+                self.die_count)
+
+    @property
     def core_count(self) -> int:
-        return self.core_rows * self.core_cols * self.die_count
+        return self.core_group_count * self.cores_per_group
 
     @property
     def hbm_bandwidth_bytes_per_ns(self) -> float:
@@ -56,6 +64,14 @@ class Hardware:
     @property
     def sram_bytes_per_core(self) -> float:
         return self.core_sram_mb * 1_000_000.0
+
+    @property
+    def sram_bytes_per_group(self) -> float:
+        return self.sram_bytes_per_core * self.cores_per_group
+
+    @property
+    def sram_bw_bytes_per_group_ns(self) -> float:
+        return self.sram_bw_bytes_per_core_ns * self.cores_per_group
 
 
 @dataclass(frozen=True)
@@ -88,7 +104,7 @@ class SpecParams:
     fallback_enabled: bool
     fallback_min_speedup: float
     fallback_alpha_min: float
-    core_granularity: int
+    core_group_granularity: int
     journal_sram_fraction: float
     active_cohorts: int
     safety_factor: float
@@ -176,6 +192,9 @@ def parse_hardware(base_cfg: Dict, exp_cfg: Dict) -> Hardware:
         noc_width_bits=hw.get("noc_width_bits", 512),
         core_rows=hw.get("core_array", [16, 16])[0],
         core_cols=hw.get("core_array", [16, 16])[1],
+        core_group_rows_per_die=exp_cfg.get("core_group_array_per_die", [2, 4])[0],
+        core_group_cols_per_die=exp_cfg.get("core_group_array_per_die", [2, 4])[1],
+        cores_per_group=int(exp_cfg.get("cores_per_core_group", 16)),
         instance_shape=(int(shape[0]), int(shape[1])),
         sram_bw_bytes_per_core_ns=exp_cfg.get("sram_bw_bytes_per_core_ns", 4096.0),
     )
@@ -205,7 +224,7 @@ def parse_params(exp_cfg: Dict) -> SpecParams:
         fallback_enabled=bool(spec.get("fallback_enabled", True)),
         fallback_min_speedup=float(spec.get("fallback_min_speedup", 1.05)),
         fallback_alpha_min=float(spec.get("fallback_alpha_min", 0.6)),
-        core_granularity=int(spec.get("core_granularity", 64)),
+        core_group_granularity=int(spec.get("core_group_granularity", spec.get("core_granularity", 1))),
         journal_sram_fraction=float(spec.get("journal_sram_fraction", 0.35)),
         active_cohorts=int(spec.get("active_cohorts", 4)),
         safety_factor=float(spec.get("safety_factor", 0.85)),
@@ -285,6 +304,9 @@ def sync_ops(model: Model, context_tokens: int, committed_tokens: float) -> floa
     return model.num_layers * (12.0 * h * h + 2.0 * n * h)
 
 
+def groups_to_cores(groups: int, hw: Hardware) -> int:
+    return max(1, groups) * hw.cores_per_group
+
 def compute_ns(ops: float, cores: int, hw: Hardware, efficiency: float) -> float:
     usable_cores = max(1, cores)
     return ops / max(1e-9, usable_cores * hw.core_compute_gflops * efficiency)
@@ -326,7 +348,7 @@ def round_up_to_granularity(value: float, granularity: int, minimum: int) -> int
 
 def make_partition(values: Sequence[float], hw: Hardware, granularity: int) -> Partition:
     minimum = granularity
-    total = hw.core_count
+    total = hw.core_group_count
     raw_sum = sum(max(0.0, v) for v in values)
     if raw_sum <= 0.0:
         values = [0.4, 0.25, 0.1, 0.25]
@@ -351,7 +373,7 @@ def candidate_partitions(hw: Hardware,
                          gamma: int,
                          prompt_tokens: int,
                          context_tokens: int) -> List[Partition]:
-    gran = params.core_granularity
+    gran = params.core_group_granularity
     e_commit = expected_committed(params.default_alpha, gamma)
     works = [
         prefill_ops(target, prompt_tokens),
@@ -387,9 +409,9 @@ def candidate_partitions(hw: Hardware,
                                 base_tuple[1] + d1 * gran,
                                 base_tuple[2] + d2 * gran,
                                 base_tuple[3] + d3 * gran]
-                        if min(vals) < gran or sum(vals) > hw.core_count:
+                        if min(vals) < gran or sum(vals) > hw.core_group_count:
                             continue
-                        leftover = hw.core_count - sum(vals)
+                        leftover = hw.core_group_count - sum(vals)
                         if leftover >= gran:
                             # Give spare cores to the currently dominant target stage.
                             vals[0 if works[0] >= works[1] else 1] += leftover
@@ -404,7 +426,7 @@ def fixed_partition(hw: Hardware, params: SpecParams) -> Partition:
         fp.get("target_verify", 0.28),
         fp.get("draft_prefill", 0.12),
         fp.get("draft_decode", 0.20),
-    ], hw, params.core_granularity)
+    ], hw, params.core_group_granularity)
 
 
 def face_decode_cost(hw: Hardware, target: Model, params: SpecParams, context_tokens: int) -> float:
@@ -438,9 +460,9 @@ def evaluate_partition(mode: str,
     e_commit = expected_committed(alpha, gamma)
     face_cost = face_decode_cost(hw, target, params, context_tokens)
 
-    tp_compute = compute_ns(prefill_ops(target, prompt_tokens), part.target_prefill, hw,
+    tp_compute = compute_ns(prefill_ops(target, prompt_tokens), groups_to_cores(part.target_prefill, hw), hw,
                             params.target_prefill_eff)
-    dp_compute = compute_ns(prefill_ops(draft, prompt_tokens), part.draft_prefill, hw,
+    dp_compute = compute_ns(prefill_ops(draft, prompt_tokens), groups_to_cores(part.draft_prefill, hw), hw,
                             params.draft_prefill_eff)
     prefill_mem = hbm_ns(prefill_bytes(target, prompt_tokens) +
                          prefill_bytes(draft, prompt_tokens), hw, params)
@@ -450,11 +472,11 @@ def evaluate_partition(mode: str,
     prefill_time = max(tp_compute, dp_compute, prefill_mem, prefill_noc)
 
     tv_compute = compute_ns(verify_ops(target, gamma, context_tokens),
-                            part.target_verify, hw, params.target_verify_eff)
+                            groups_to_cores(part.target_verify, hw), hw, params.target_verify_eff)
     dd_compute = compute_ns(decode_ops(draft, gamma, context_tokens),
-                            part.draft_decode, hw, params.draft_decode_eff)
+                            groups_to_cores(part.draft_decode, hw), hw, params.draft_decode_eff)
     ds_compute = compute_ns(sync_ops(draft, context_tokens, e_commit),
-                            part.draft_decode, hw, params.draft_decode_eff)
+                            groups_to_cores(part.draft_decode, hw), hw, params.draft_decode_eff)
     draft_compute_time = dd_compute + ds_compute
     target_compute_time = tv_compute
 
@@ -477,9 +499,9 @@ def evaluate_partition(mode: str,
 
     journal_bytes_per_round = gamma * draft.kv_bytes_per_token if journal else 0.0
     journal_peak = journal_bytes_per_round * params.active_cohorts
-    journal_capacity = (part.draft_decode * hw.sram_bytes_per_core *
+    journal_capacity = (part.draft_decode * hw.sram_bytes_per_group *
                         params.journal_sram_fraction)
-    sram_bw = max(1.0, part.draft_decode * hw.sram_bw_bytes_per_core_ns)
+    sram_bw = max(1.0, part.draft_decode * hw.sram_bw_bytes_per_group_ns)
     journal_time = journal_bytes_per_round / sram_bw if journal else 0.0
     excess_journal = max(0.0, journal_peak - journal_capacity * params.safety_factor)
     journal_stall = excess_journal / sram_bw if journal else 0.0
@@ -637,7 +659,7 @@ def face_row(hw: Hardware,
     prefill = face_prefill_cost(hw, target, params, prompt_tokens)
     bottleneck_values = {"compute": comp, "hbm": mem, "noc": noc}
     bottleneck = max(bottleneck_values, key=bottleneck_values.get)
-    part = Partition(hw.core_count, 0, 0, 0)
+    part = Partition(hw.core_group_count, 0, 0, 0)
     return MappingResult(
         mode="FACE",
         alpha=alpha,
@@ -679,10 +701,10 @@ def result_to_row(result: MappingResult) -> Dict[str, object]:
         "gamma": result.gamma,
         "fallback": int(result.fallback),
         "journal": int(result.journal),
-        "target_prefill_cores": result.partition.target_prefill,
-        "target_verify_cores": result.partition.target_verify,
-        "draft_prefill_cores": result.partition.draft_prefill,
-        "draft_decode_cores": result.partition.draft_decode,
+        "target_prefill_groups": result.partition.target_prefill,
+        "target_verify_groups": result.partition.target_verify,
+        "draft_prefill_groups": result.partition.draft_prefill,
+        "draft_decode_groups": result.partition.draft_decode,
         "expected_accepted": f"{result.expected_accepted:.6f}",
         "expected_committed": f"{result.expected_committed:.6f}",
         "face_ns_per_token": f"{result.face_ns_per_token:.3f}",
@@ -851,10 +873,10 @@ def run_workload_variants(hw: Hardware,
             "face_e2e_ns": f"{face_e2e:.3f}",
             "specface_e2e_ns": f"{spec_e2e:.3f}",
             "e2e_speedup": f"{face_e2e / max(1e-9, spec_e2e):.6f}",
-            "target_prefill_cores": spec.partition.target_prefill,
-            "target_verify_cores": spec.partition.target_verify,
-            "draft_prefill_cores": spec.partition.draft_prefill,
-            "draft_decode_cores": spec.partition.draft_decode,
+            "target_prefill_groups": spec.partition.target_prefill,
+            "target_verify_groups": spec.partition.target_verify,
+            "draft_prefill_groups": spec.partition.draft_prefill,
+            "draft_decode_groups": spec.partition.draft_decode,
             "bottleneck": spec.bottleneck,
         })
     return rows
@@ -863,7 +885,8 @@ def run_workload_variants(hw: Hardware,
 def make_plots(summary: Sequence[MappingResult],
                workload_rows: Sequence[Dict[str, object]],
                default_alpha: float,
-               plot_dir: Path) -> List[Path]:
+               plot_dir: Path,
+               hw: Hardware) -> List[Path]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -886,7 +909,7 @@ def make_plots(summary: Sequence[MappingResult],
     }
 
     if selected:
-        paths.append(draw_mapping_layouts(selected, plot_dir, colors))
+        paths.append(draw_mapping_layouts(selected, plot_dir, colors, hw))
         paths.append(draw_workflow_timelines(selected, plot_dir, colors))
 
     if spec_selected:
@@ -903,7 +926,7 @@ def make_plots(summary: Sequence[MappingResult],
         for name, values in zip(names, data):
             ax.bar(labels, values, bottom=bottom, label=name, color=colors[name])
             bottom = [a + b for a, b in zip(bottom, values)]
-        ax.set_ylabel("cores")
+        ax.set_ylabel("core groups")
         ax.set_title(f"SpecFACE workflow core partitions at alpha={default_alpha}")
         ax.legend(ncol=2, fontsize=8)
         ax.tick_params(axis="x", rotation=25)
@@ -991,59 +1014,79 @@ def workflow_label(result: MappingResult) -> str:
     return label
 
 
-def layout_rectangles(result: MappingResult) -> List[Dict[str, object]]:
-    total = max(1, result.partition.total)
-    width = 64.0
-    height = 64.0
+def core_group_cells(hw: Hardware) -> List[Dict[str, int]]:
+    cells: List[Dict[str, int]] = []
+    global_cols = hw.instance_shape[1] * hw.core_group_cols_per_die
+    for die_r in range(hw.instance_shape[0]):
+        for group_r in range(hw.core_group_rows_per_die):
+            for die_c in range(hw.instance_shape[1]):
+                for group_c in range(hw.core_group_cols_per_die):
+                    global_r = die_r * hw.core_group_rows_per_die + group_r
+                    global_c = die_c * hw.core_group_cols_per_die + group_c
+                    cells.append({
+                        "die_r": die_r,
+                        "die_c": die_c,
+                        "die_id": die_r * hw.instance_shape[1] + die_c,
+                        "group_r": group_r,
+                        "group_c": group_c,
+                        "global_r": global_r,
+                        "global_c": global_c,
+                        "group_id": global_r * global_cols + global_c,
+                    })
+    return cells
+
+
+def core_group_assignments(result: MappingResult, hw: Hardware) -> List[Dict[str, object]]:
+    cells = core_group_cells(hw)
+    assigned: Dict[int, str] = {}
+    region_meta = {
+        "target decode": ("TD", "target_verify"),
+        "target prefill": ("TP", "target_prefill"),
+        "target verify": ("TV", "target_verify"),
+        "draft decode": ("DD", "draft_decode"),
+        "draft prefill/sync": ("DP", "draft_prefill"),
+    }
+
+    def take(sorted_cells: Sequence[Dict[str, int]], count: int, region: str) -> None:
+        remaining = max(0, count)
+        for cell in sorted_cells:
+            gid = int(cell["group_id"])
+            if gid in assigned:
+                continue
+            assigned[gid] = region
+            remaining -= 1
+            if remaining <= 0:
+                return
+
     if result.mode == "FACE":
-        return [{
-            "name": "target decode",
-            "x": 0.0,
-            "y": 0.0,
-            "w": width,
-            "h": height,
-            "color": "target_prefill",
-            "cores": result.partition.target_prefill,
-        }]
+        take(cells, hw.core_group_count, "target decode")
+    else:
+        top_first = sorted(cells, key=lambda c: (c["global_r"], c["global_c"]))
+        bottom_first = sorted(cells, key=lambda c: (-c["global_r"], c["global_c"]))
+        take(top_first, result.partition.target_prefill, "target prefill")
+        take(bottom_first, result.partition.draft_prefill, "draft prefill/sync")
+        middle_left = sorted(cells, key=lambda c: (c["global_c"], c["global_r"]))
+        take(middle_left, result.partition.target_verify, "target verify")
+        middle_right = sorted(cells, key=lambda c: (-c["global_c"], c["global_r"]))
+        take(middle_right, result.partition.draft_decode, "draft decode")
 
-    tp = result.partition.target_prefill
-    tv = result.partition.target_verify
-    dp = result.partition.draft_prefill
-    dd = result.partition.draft_decode
-    rects: List[Dict[str, object]] = []
-    y = height
-
-    def add_rect(name: str, x: float, y0: float, w: float, h: float,
-                 color: str, cores: int) -> None:
-        if cores <= 0 or h <= 0.0 or w <= 0.0:
-            return
-        rects.append({
-            "name": name,
-            "x": x,
-            "y": y0,
-            "w": w,
-            "h": h,
+    rows: List[Dict[str, object]] = []
+    for cell in cells:
+        gid = int(cell["group_id"])
+        region = assigned.get(gid, "unassigned")
+        abbrev, color = region_meta.get(region, ("--", "noc"))
+        row: Dict[str, object] = dict(cell)
+        row.update({
+            "workflow": workflow_label(result),
+            "gamma": result.gamma,
+            "fallback": int(result.fallback),
+            "region": region,
+            "abbrev": abbrev,
             "color": color,
-            "cores": cores,
+            "cores": hw.cores_per_group,
         })
-
-    tp_h = height * tp / total
-    y -= tp_h
-    add_rect("target prefill", 0.0, y, width, tp_h, "target_prefill", tp)
-
-    middle = tv + dd
-    middle_h = height * middle / total
-    y -= middle_h
-    if middle > 0:
-        tv_w = width * tv / middle
-        add_rect("target verify", 0.0, y, tv_w, middle_h, "target_verify", tv)
-        add_rect("draft decode", tv_w, y, width - tv_w, middle_h,
-                 "draft_decode", dd)
-
-    dp_h = height * dp / total
-    y -= dp_h
-    add_rect("draft prefill/sync", 0.0, y, width, dp_h, "draft_prefill", dp)
-    return rects
+        rows.append(row)
+    return rows
 
 
 def timeline_events(result: MappingResult) -> List[Dict[str, object]]:
@@ -1108,67 +1151,92 @@ def write_timeline_csv(path: Path, selected: Sequence[MappingResult]) -> None:
     write_csv(path, rows)
 
 
-
-def write_layout_csv(path: Path, selected: Sequence[MappingResult]) -> None:
+def write_layout_csv(path: Path, selected: Sequence[MappingResult], hw: Hardware) -> None:
     rows: List[Dict[str, object]] = []
     for result in selected:
-        for rect in layout_rectangles(result):
+        for cell in core_group_assignments(result, hw):
             rows.append({
-                "workflow": workflow_label(result),
-                "gamma": result.gamma,
-                "fallback": int(result.fallback),
-                "region": rect["name"],
-                "cores": rect["cores"],
-                "x": f"{float(rect['x']):.3f}",
-                "y": f"{float(rect['y']):.3f}",
-                "w": f"{float(rect['w']):.3f}",
-                "h": f"{float(rect['h']):.3f}",
+                "workflow": cell["workflow"],
+                "gamma": cell["gamma"],
+                "fallback": cell["fallback"],
+                "die_id": cell["die_id"],
+                "die_r": cell["die_r"],
+                "die_c": cell["die_c"],
+                "group_id": cell["group_id"],
+                "global_r": cell["global_r"],
+                "global_c": cell["global_c"],
+                "group_r": cell["group_r"],
+                "group_c": cell["group_c"],
+                "region": cell["region"],
+                "abbrev": cell["abbrev"],
+                "cores_per_group": cell["cores"],
             })
     write_csv(path, rows)
 
+
 def draw_mapping_layouts(selected: Sequence[MappingResult], plot_dir: Path,
-                         colors: Dict[str, str]) -> Path:
+                         colors: Dict[str, str], hw: Hardware) -> Path:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
 
     cols = min(3, max(1, len(selected)))
     rows = math.ceil(len(selected) / cols)
-    fig, axes = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.4 * rows))
-    if not isinstance(axes, (list, tuple)):
-        axes_list = list(getattr(axes, "flat", [axes]))
-    else:
-        axes_list = list(axes)
-    if hasattr(axes, "flat"):
-        axes_list = list(axes.flat)
+    total_cols = hw.instance_shape[1] * hw.core_group_cols_per_die
+    total_rows = hw.instance_shape[0] * hw.core_group_rows_per_die
+    fig, axes = plt.subplots(rows, cols, figsize=(4.8 * cols, 3.8 * rows))
+    axes_list = list(axes.flat) if hasattr(axes, "flat") else [axes]
 
     for ax, result in zip(axes_list, selected):
-        ax.set_xlim(0, 64)
-        ax.set_ylim(0, 64)
+        assignments = core_group_assignments(result, hw)
+        ax.set_xlim(0, total_cols)
+        ax.set_ylim(total_rows, 0)
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(f"{workflow_label(result)}\ngamma={result.gamma}, speedup={result.speedup_over_face:.2f}x",
-                     fontsize=10)
-        for rect in layout_rectangles(result):
-            patch = patches.Rectangle((rect["x"], rect["y"]), rect["w"], rect["h"],
-                                      linewidth=1.2, edgecolor="#1a202c",
-                                      facecolor=colors[str(rect["color"])], alpha=0.88)
+        part = result.partition
+        ax.set_title(
+            f"{workflow_label(result)} | g={result.gamma} | speedup={result.speedup_over_face:.2f}x\n"
+            f"TP/TV/DP/DD={part.target_prefill}/{part.target_verify}/"
+            f"{part.draft_prefill}/{part.draft_decode} groups",
+            fontsize=9,
+        )
+        for cell in assignments:
+            x = int(cell["global_c"])
+            y = int(cell["global_r"])
+            patch = patches.Rectangle((x, y), 1, 1,
+                                      facecolor=colors[str(cell["color"])],
+                                      edgecolor="#1f2937", linewidth=0.7,
+                                      alpha=0.92)
             ax.add_patch(patch)
-            area = float(rect["w"]) * float(rect["h"])
-            if area > 110:
-                ax.text(float(rect["x"]) + float(rect["w"]) / 2,
-                        float(rect["y"]) + float(rect["h"]) / 2,
-                        f"{rect['name']}\n{rect['cores']} cores",
-                        ha="center", va="center", fontsize=8, color="#111827")
-        ax.text(0, -4.8, "topology: TP top, TV/DD middle, DP bottom",
+            ax.text(x + 0.5, y + 0.52, str(cell["abbrev"]),
+                    ha="center", va="center", fontsize=7, color="#111827")
+        for die_col in range(1, hw.instance_shape[1]):
+            x = die_col * hw.core_group_cols_per_die
+            ax.plot([x, x], [0, total_rows], color="#111827", linewidth=2.0)
+        for die_row in range(1, hw.instance_shape[0]):
+            y = die_row * hw.core_group_rows_per_die
+            ax.plot([0, total_cols], [y, y], color="#111827", linewidth=2.0)
+        ax.text(0, total_rows + 0.45,
+                f"2x2 dies, each die {hw.core_group_rows_per_die}x{hw.core_group_cols_per_die} groups, "
+                f"{hw.cores_per_group} cores/group",
                 fontsize=7, color="#4a5568")
 
     for ax in axes_list[len(selected):]:
         ax.axis("off")
-    fig.suptitle("Intuitive core-island mapping layouts", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    legend_items = [
+        ("TP", "target_prefill"),
+        ("TV", "target_verify"),
+        ("DP", "draft_prefill"),
+        ("DD", "draft_decode"),
+        ("TD", "target_verify"),
+    ]
+    handles = [patches.Patch(color=colors[color], label=label)
+               for label, color in legend_items]
+    fig.legend(handles=handles, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 0.995), fontsize=8)
+    fig.suptitle("Per-core-group workflow mapping layouts", fontsize=14, y=1.03)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     path = plot_dir / "workflow_mapping_layouts.png"
-    fig.savefig(path, dpi=180)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -1178,48 +1246,72 @@ def draw_workflow_timelines(selected: Sequence[MappingResult], plot_dir: Path,
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
 
-    lanes = ["Target", "Draft", "HBM", "SRAM", "NoC"]
-    lane_y = {lane: idx for idx, lane in enumerate(reversed(lanes))}
-    fig, axes = plt.subplots(len(selected), 1,
-                             figsize=(12, max(3.0, 1.75 * len(selected))),
-                             sharex=False)
-    if len(selected) == 1:
-        axes = [axes]
-    for ax, result in zip(axes, selected):
-        events = timeline_events(result)
-        max_end = max((float(e["end_ns"]) for e in events), default=1.0)
-        scale = 1000.0
-        for event in events:
-            y = lane_y[str(event["lane"])]
-            start = float(event["start_ns"]) / scale
-            dur = float(event["duration_ns"]) / scale
-            patch = patches.Rectangle((start, y - 0.34), dur, 0.68,
-                                      facecolor=colors[str(event["color"])],
-                                      edgecolor="#1a202c", linewidth=0.8, alpha=0.9)
-            ax.add_patch(patch)
-            if dur > max_end / scale * 0.08:
-                ax.text(start + dur / 2, y, str(event["name"]),
+    fig, ax = plt.subplots(figsize=(13.5, max(4.2, 0.85 * len(selected) + 1.6)))
+    lane_offsets = {
+        "Target": 0.24,
+        "Draft": 0.08,
+        "HBM": -0.08,
+        "SRAM": -0.24,
+        "NoC": -0.36,
+    }
+    lane_height = 0.13
+    scale = 1000.0
+    y_positions = {workflow_label(result): idx for idx, result in enumerate(reversed(selected))}
+    max_end = 1.0
+
+    for result in selected:
+        label = workflow_label(result)
+        base_y = y_positions[label]
+        for event in timeline_events(result):
+            start_us = float(event["start_ns"]) / scale
+            duration_us = float(event["duration_ns"]) / scale
+            max_end = max(max_end, start_us + duration_us)
+            lane = str(event["lane"])
+            y = base_y + lane_offsets.get(lane, 0.0)
+            rect = patches.Rectangle((start_us, y - lane_height / 2),
+                                     duration_us, lane_height,
+                                     facecolor=colors[str(event["color"])],
+                                     edgecolor="#1f2937", linewidth=0.6,
+                                     alpha=0.9)
+            ax.add_patch(rect)
+            if duration_us > max_end * 0.06:
+                ax.text(start_us + duration_us / 2, y, str(event["name"]),
                         ha="center", va="center", fontsize=7)
-        ax.set_yticks([lane_y[l] for l in lanes])
-        ax.set_yticklabels(lanes)
-        ax.set_xlim(0, max_end / scale * 1.05)
-        ax.set_ylim(-0.7, len(lanes) - 0.3)
-        ax.grid(axis="x", alpha=0.25)
-        ax.set_title(f"{workflow_label(result)} timeline: gamma={result.gamma}, "
-                     f"fallback={int(result.fallback)}, bottleneck={result.bottleneck}",
-                     fontsize=10)
-        ax.set_xlabel("time (us)")
-    fig.suptitle("Workflow execution over time", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+        ax.text(max_end * 0.01, base_y + 0.38,
+                f"gamma={result.gamma}, fallback={int(result.fallback)}, bottleneck={result.bottleneck}",
+                fontsize=7, color="#4a5568")
+
+    labels = [workflow_label(r) for r in reversed(selected)]
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("time (us)")
+    ax.set_ylabel("workflow")
+    ax.set_xlim(0, max_end * 1.05)
+    ax.set_ylim(-0.75, len(selected) - 0.25)
+    ax.grid(axis="x", alpha=0.25)
+    legend_items = [
+        ("Target", "target_verify"),
+        ("Draft", "draft_decode"),
+        ("HBM", "hbm"),
+        ("SRAM", "sram"),
+        ("NoC", "noc"),
+    ]
+    handles = [patches.Patch(color=colors[color], label=label)
+               for label, color in legend_items]
+    ax.legend(handles=handles, ncol=5, loc="upper right", fontsize=8)
+    ax.set_title("Workflow execution over time (one row per workflow)")
+    fig.tight_layout()
     path = plot_dir / "workflow_timelines.png"
     fig.savefig(path, dpi=180)
     plt.close(fig)
     return path
 
+
 def write_markdown_summary(path: Path,
                            default_alpha: float,
                            summary: List[MappingResult],
                            workload_rows: Sequence[Dict[str, object]],
+                           hw: Hardware,
                            output_dir: Path,
                            plot_dir: Path,
                            plot_paths: Sequence[Path]) -> None:
@@ -1234,8 +1326,16 @@ def write_markdown_summary(path: Path,
         "",
         "This single-instance analytical experiment uses the lightweight OME "
         "search from `docs/images/SpecFACE_plan.md` and the FACE WSC baseline "
-        "configuration. It now emits plots for workflow partitioning, online "
-        "overlap, resource usage, and workload-class speedups.",
+        "configuration. The instance model is corrected to use core-group "
+        "granularity: the OME searches integer workflow partitions over "
+        f"`{hw.instance_shape[0]}x{hw.instance_shape[1]}` dies, each die has "
+        f"`{hw.core_group_rows_per_die}x{hw.core_group_cols_per_die}` core "
+        f"groups, for `{hw.core_group_count}` groups total and "
+        f"`{hw.cores_per_group}` cores per group.",
+        "",
+        "The mapping figure renders one cell per core group. The timeline "
+        "figure uses time on the x-axis and one row per workflow so pipeline "
+        "busy/idle behavior is visible directly.",
         "",
         f"Output directory: `{output_dir}`",
         f"Plot directory: `{plot_dir}`",
@@ -1244,7 +1344,7 @@ def write_markdown_summary(path: Path,
         "",
         f"Default acceptance rate: `{default_alpha}`",
         "",
-        "| mode | gamma | fallback | ns/token | speedup vs FACE | partition TP/TV/DP/DD | bottleneck |",
+        "| mode | gamma | fallback | ns/token | speedup vs FACE | partition TP/TV/DP/DD (groups) | bottleneck |",
         "|---|---:|---:|---:|---:|---|---|",
     ]
     for r in rows:
@@ -1286,6 +1386,10 @@ def write_markdown_summary(path: Path,
     lines.append(
         "These numbers are not cycle-accurate; they are meant to drive the first "
         "microarchitecture sweep and identify useful regions for the simulator implementation.")
+    lines.append(
+        "`specface_core_group_mapping.csv` contains one row per workflow/core-group "
+        "cell with die coordinates, group coordinates, assigned workflow, and "
+        "cores per group.")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
 
@@ -1393,12 +1497,13 @@ def run(config_path: Path) -> None:
         "../../../docs/images/specface_experiment_001",
     ))
     selected_default = select_default_workflow_rows(summary_results, params.default_alpha)
-    write_layout_csv(output_dir / "specface_mapping_rects.csv", selected_default)
+    core_group_mapping_path = output_dir / "specface_core_group_mapping.csv"
+    write_layout_csv(core_group_mapping_path, selected_default, hw)
     write_timeline_csv(output_dir / "specface_timeline_events.csv", selected_default)
 
-    plot_paths = make_plots(summary_results, workload_rows, params.default_alpha, plot_dir)
+    plot_paths = make_plots(summary_results, workload_rows, params.default_alpha, plot_dir, hw)
     write_markdown_summary(summary_doc, params.default_alpha, summary_results,
-                           workload_rows, output_dir, plot_dir, plot_paths)
+                           workload_rows, hw, output_dir, plot_dir, plot_paths)
 
     print(f"SpecFACE micro experiment complete")
     print(f"  config: {config_path}")
@@ -1406,7 +1511,7 @@ def run(config_path: Path) -> None:
     print(f"  summary: {output_dir / 'specface_summary.csv'}")
     print(f"  gamma_sweep: {output_dir / 'specface_gamma_sweep.csv'}")
     print(f"  workload_summary: {output_dir / 'specface_workload_summary.csv'}")
-    print(f"  mapping_rects: {output_dir / 'specface_mapping_rects.csv'}")
+    print(f"  core_group_mapping: {core_group_mapping_path}")
     print(f"  timeline_events: {output_dir / 'specface_timeline_events.csv'}")
     print(f"  plots: {plot_dir}")
     print(f"  report: {summary_doc}")

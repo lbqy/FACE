@@ -4,8 +4,8 @@
   "output_dir": "outputs",
   "summary_markdown": "../../../docs/images/SpecFACE_experiment_001.md",
   "instance_shape": [
-    4,
-    4
+    2,
+    2
   ],
   "context_tokens": 747,
   "sram_bw_bytes_per_core_ns": 4096,
@@ -51,7 +51,6 @@
     "fallback_enabled": true,
     "fallback_min_speedup": 1.05,
     "fallback_alpha_min": 0.6,
-    "core_granularity": 64,
     "journal_sram_fraction": 0.35,
     "active_cohorts": 4,
     "safety_factor": 0.85,
@@ -67,7 +66,8 @@
       "target_verify": 0.28,
       "draft_prefill": 0.12,
       "draft_decode": 0.2
-    }
+    },
+    "core_group_granularity": 1
   },
   "plot_dir": "../../../docs/images/specface_experiment_001",
   "workload_variants": [
@@ -101,5 +101,10 @@
       "output_tokens": 128,
       "context_tokens": 1024
     }
-  ]
+  ],
+  "core_group_array_per_die": [
+    2,
+    4
+  ],
+  "cores_per_core_group": 16
 }
