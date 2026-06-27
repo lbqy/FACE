@@ -885,6 +885,10 @@ def make_plots(summary: Sequence[MappingResult],
         "noc": "#718096",
     }
 
+    if selected:
+        paths.append(draw_mapping_layouts(selected, plot_dir, colors))
+        paths.append(draw_workflow_timelines(selected, plot_dir, colors))
+
     if spec_selected:
         labels = [r.mode.replace("SpecFACE-", "") for r in spec_selected]
         data = [
@@ -976,6 +980,241 @@ def make_plots(summary: Sequence[MappingResult],
         paths.append(path)
 
     return paths
+
+
+def workflow_label(result: MappingResult) -> str:
+    if result.mode == "FACE":
+        return "FACE"
+    label = result.mode.replace("SpecFACE-", "")
+    if result.mode == "SpecFACE-static-gamma":
+        label = f"static-g{result.gamma}"
+    return label
+
+
+def layout_rectangles(result: MappingResult) -> List[Dict[str, object]]:
+    total = max(1, result.partition.total)
+    width = 64.0
+    height = 64.0
+    if result.mode == "FACE":
+        return [{
+            "name": "target decode",
+            "x": 0.0,
+            "y": 0.0,
+            "w": width,
+            "h": height,
+            "color": "target_prefill",
+            "cores": result.partition.target_prefill,
+        }]
+
+    tp = result.partition.target_prefill
+    tv = result.partition.target_verify
+    dp = result.partition.draft_prefill
+    dd = result.partition.draft_decode
+    rects: List[Dict[str, object]] = []
+    y = height
+
+    def add_rect(name: str, x: float, y0: float, w: float, h: float,
+                 color: str, cores: int) -> None:
+        if cores <= 0 or h <= 0.0 or w <= 0.0:
+            return
+        rects.append({
+            "name": name,
+            "x": x,
+            "y": y0,
+            "w": w,
+            "h": h,
+            "color": color,
+            "cores": cores,
+        })
+
+    tp_h = height * tp / total
+    y -= tp_h
+    add_rect("target prefill", 0.0, y, width, tp_h, "target_prefill", tp)
+
+    middle = tv + dd
+    middle_h = height * middle / total
+    y -= middle_h
+    if middle > 0:
+        tv_w = width * tv / middle
+        add_rect("target verify", 0.0, y, tv_w, middle_h, "target_verify", tv)
+        add_rect("draft decode", tv_w, y, width - tv_w, middle_h,
+                 "draft_decode", dd)
+
+    dp_h = height * dp / total
+    y -= dp_h
+    add_rect("draft prefill/sync", 0.0, y, width, dp_h, "draft_prefill", dp)
+    return rects
+
+
+def timeline_events(result: MappingResult) -> List[Dict[str, object]]:
+    events: List[Dict[str, object]] = []
+
+    def add(lane: str, name: str, start: float, duration: float, color: str) -> None:
+        if duration <= 0.0:
+            return
+        events.append({
+            "workflow": workflow_label(result),
+            "lane": lane,
+            "name": name,
+            "start_ns": start,
+            "end_ns": start + duration,
+            "duration_ns": duration,
+            "color": color,
+        })
+
+    if result.mode == "FACE" or result.fallback:
+        add("Target", "target decode", 0.0, result.target_compute_ns,
+            "target_verify")
+        add("HBM", "KV read/write", 0.0, result.memory_ns, "hbm")
+        add("NoC", "collective/data move", 0.0, result.noc_ns, "noc")
+        return events
+
+    prefill_target = result.prefill_ns * 0.78
+    prefill_draft = result.prefill_ns * 0.35
+    add("Target", "target prefill", 0.0, prefill_target,
+        "target_prefill")
+    add("Draft", "draft prefill", 0.0, prefill_draft,
+        "draft_prefill")
+    add("HBM", "prefill weights/KV", 0.0, result.prefill_ns * 0.55, "hbm")
+
+    gap = result.prefill_ns * 0.08
+    round_start = result.prefill_ns + gap
+    draft_decode = max(0.0, result.draft_compute_ns * 0.86)
+    draft_sync = max(0.0, result.draft_compute_ns - draft_decode)
+    target_verify = result.target_compute_ns
+    hbm_start = round_start
+    sram = result.journal_ns + result.journal_stall_ns
+
+    add("Draft", f"draft decode g={result.gamma}", round_start,
+        draft_decode, "draft_decode")
+    add("SRAM", "journal write", round_start, sram, "sram")
+    add("Target", "target verify", round_start + draft_decode * 0.12,
+        target_verify, "target_verify")
+    add("Draft", "draft sync", round_start + draft_decode,
+        draft_sync, "draft_prefill")
+    add("HBM", "KV read / commit", hbm_start, result.memory_ns, "hbm")
+    add("NoC", "broadcast/reduce", hbm_start, result.noc_ns, "noc")
+    return events
+
+
+def write_timeline_csv(path: Path, selected: Sequence[MappingResult]) -> None:
+    rows: List[Dict[str, object]] = []
+    for result in selected:
+        for event in timeline_events(result):
+            row = dict(event)
+            for key in ["start_ns", "end_ns", "duration_ns"]:
+                row[key] = f"{float(row[key]):.3f}"
+            rows.append(row)
+    write_csv(path, rows)
+
+
+
+def write_layout_csv(path: Path, selected: Sequence[MappingResult]) -> None:
+    rows: List[Dict[str, object]] = []
+    for result in selected:
+        for rect in layout_rectangles(result):
+            rows.append({
+                "workflow": workflow_label(result),
+                "gamma": result.gamma,
+                "fallback": int(result.fallback),
+                "region": rect["name"],
+                "cores": rect["cores"],
+                "x": f"{float(rect['x']):.3f}",
+                "y": f"{float(rect['y']):.3f}",
+                "w": f"{float(rect['w']):.3f}",
+                "h": f"{float(rect['h']):.3f}",
+            })
+    write_csv(path, rows)
+
+def draw_mapping_layouts(selected: Sequence[MappingResult], plot_dir: Path,
+                         colors: Dict[str, str]) -> Path:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    cols = min(3, max(1, len(selected)))
+    rows = math.ceil(len(selected) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(5.0 * cols, 4.4 * rows))
+    if not isinstance(axes, (list, tuple)):
+        axes_list = list(getattr(axes, "flat", [axes]))
+    else:
+        axes_list = list(axes)
+    if hasattr(axes, "flat"):
+        axes_list = list(axes.flat)
+
+    for ax, result in zip(axes_list, selected):
+        ax.set_xlim(0, 64)
+        ax.set_ylim(0, 64)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(f"{workflow_label(result)}\ngamma={result.gamma}, speedup={result.speedup_over_face:.2f}x",
+                     fontsize=10)
+        for rect in layout_rectangles(result):
+            patch = patches.Rectangle((rect["x"], rect["y"]), rect["w"], rect["h"],
+                                      linewidth=1.2, edgecolor="#1a202c",
+                                      facecolor=colors[str(rect["color"])], alpha=0.88)
+            ax.add_patch(patch)
+            area = float(rect["w"]) * float(rect["h"])
+            if area > 110:
+                ax.text(float(rect["x"]) + float(rect["w"]) / 2,
+                        float(rect["y"]) + float(rect["h"]) / 2,
+                        f"{rect['name']}\n{rect['cores']} cores",
+                        ha="center", va="center", fontsize=8, color="#111827")
+        ax.text(0, -4.8, "topology: TP top, TV/DD middle, DP bottom",
+                fontsize=7, color="#4a5568")
+
+    for ax in axes_list[len(selected):]:
+        ax.axis("off")
+    fig.suptitle("Intuitive core-island mapping layouts", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    path = plot_dir / "workflow_mapping_layouts.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def draw_workflow_timelines(selected: Sequence[MappingResult], plot_dir: Path,
+                            colors: Dict[str, str]) -> Path:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    lanes = ["Target", "Draft", "HBM", "SRAM", "NoC"]
+    lane_y = {lane: idx for idx, lane in enumerate(reversed(lanes))}
+    fig, axes = plt.subplots(len(selected), 1,
+                             figsize=(12, max(3.0, 1.75 * len(selected))),
+                             sharex=False)
+    if len(selected) == 1:
+        axes = [axes]
+    for ax, result in zip(axes, selected):
+        events = timeline_events(result)
+        max_end = max((float(e["end_ns"]) for e in events), default=1.0)
+        scale = 1000.0
+        for event in events:
+            y = lane_y[str(event["lane"])]
+            start = float(event["start_ns"]) / scale
+            dur = float(event["duration_ns"]) / scale
+            patch = patches.Rectangle((start, y - 0.34), dur, 0.68,
+                                      facecolor=colors[str(event["color"])],
+                                      edgecolor="#1a202c", linewidth=0.8, alpha=0.9)
+            ax.add_patch(patch)
+            if dur > max_end / scale * 0.08:
+                ax.text(start + dur / 2, y, str(event["name"]),
+                        ha="center", va="center", fontsize=7)
+        ax.set_yticks([lane_y[l] for l in lanes])
+        ax.set_yticklabels(lanes)
+        ax.set_xlim(0, max_end / scale * 1.05)
+        ax.set_ylim(-0.7, len(lanes) - 0.3)
+        ax.grid(axis="x", alpha=0.25)
+        ax.set_title(f"{workflow_label(result)} timeline: gamma={result.gamma}, "
+                     f"fallback={int(result.fallback)}, bottleneck={result.bottleneck}",
+                     fontsize=10)
+        ax.set_xlabel("time (us)")
+    fig.suptitle("Workflow execution over time", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    path = plot_dir / "workflow_timelines.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
 
 def write_markdown_summary(path: Path,
                            default_alpha: float,
@@ -1153,6 +1392,10 @@ def run(config_path: Path) -> None:
         "plot_dir",
         "../../../docs/images/specface_experiment_001",
     ))
+    selected_default = select_default_workflow_rows(summary_results, params.default_alpha)
+    write_layout_csv(output_dir / "specface_mapping_rects.csv", selected_default)
+    write_timeline_csv(output_dir / "specface_timeline_events.csv", selected_default)
+
     plot_paths = make_plots(summary_results, workload_rows, params.default_alpha, plot_dir)
     write_markdown_summary(summary_doc, params.default_alpha, summary_results,
                            workload_rows, output_dir, plot_dir, plot_paths)
@@ -1163,6 +1406,8 @@ def run(config_path: Path) -> None:
     print(f"  summary: {output_dir / 'specface_summary.csv'}")
     print(f"  gamma_sweep: {output_dir / 'specface_gamma_sweep.csv'}")
     print(f"  workload_summary: {output_dir / 'specface_workload_summary.csv'}")
+    print(f"  mapping_rects: {output_dir / 'specface_mapping_rects.csv'}")
+    print(f"  timeline_events: {output_dir / 'specface_timeline_events.csv'}")
     print(f"  plots: {plot_dir}")
     print(f"  report: {summary_doc}")
 

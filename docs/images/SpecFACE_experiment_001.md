@@ -25,6 +25,14 @@ Default acceptance rate: `0.8`
 
 ## Figures
 
+### Workflow Mapping Layouts
+
+![Workflow Mapping Layouts](specface_experiment_001/workflow_mapping_layouts.png)
+
+### Workflow Timelines
+
+![Workflow Timelines](specface_experiment_001/workflow_timelines.png)
+
 ### Workflow Partitions
 
 ![Workflow Partitions](specface_experiment_001/workflow_partitions.png)
