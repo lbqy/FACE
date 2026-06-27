@@ -628,9 +628,16 @@ def face_row(hw: Hardware,
              alpha: float,
              prompt_tokens: int,
              context_tokens: int) -> MappingResult:
-    face = face_decode_cost(hw, target, params, context_tokens)
+    decode_hbm_bytes = decode_bytes(target, 1, context_tokens)
+    comp = compute_ns(decode_ops(target, 1, context_tokens), hw.core_count, hw,
+                      params.target_decode_eff)
+    mem = hbm_ns(decode_hbm_bytes, hw, params)
+    noc = noc_ns(decode_hbm_bytes * params.noc_traffic_fraction, hw)
+    face = max(comp, mem, noc)
     prefill = face_prefill_cost(hw, target, params, prompt_tokens)
-    part = Partition(hw.core_count, hw.core_count, 0, 0)
+    bottleneck_values = {"compute": comp, "hbm": mem, "noc": noc}
+    bottleneck = max(bottleneck_values, key=bottleneck_values.get)
+    part = Partition(hw.core_count, 0, 0, 0)
     return MappingResult(
         mode="FACE",
         alpha=alpha,
@@ -646,21 +653,21 @@ def face_row(hw: Hardware,
         prefill_ns=prefill,
         pipeline_round_ns=face,
         serial_round_ns=face,
-        target_compute_ns=face,
+        target_compute_ns=comp,
         draft_compute_ns=0.0,
-        memory_ns=face,
-        noc_ns=0.0,
+        memory_ns=mem,
+        noc_ns=noc,
         journal_ns=0.0,
         journal_stall_ns=0.0,
         journal_peak_bytes=0.0,
         journal_capacity_bytes=0.0,
-        hbm_bytes_per_round=decode_bytes(target, 1, context_tokens),
+        hbm_bytes_per_round=decode_hbm_bytes,
         hbm_saved_bytes_per_round=0.0,
         target_internal_overlap=0.0,
         draft_internal_overlap=0.0,
         cross_model_overlap=0.0,
         overall_overlap=0.0,
-        bottleneck="face_decode",
+        bottleneck=bottleneck,
         score=face,
     )
 
@@ -745,10 +752,238 @@ def summarize_requests(requests: Sequence[Request],
     return rows
 
 
+
+def select_default_workflow_rows(summary: Sequence[MappingResult],
+                                 default_alpha: float) -> List[MappingResult]:
+    rows = [r for r in summary if abs(r.alpha - default_alpha) < 1e-9]
+    selected: List[MappingResult] = []
+    for mode in ["FACE", "SpecFACE-full", "SpecFACE-fixed-partition",
+                 "SpecFACE-no-journal", "SpecFACE-no-fallback"]:
+        candidates = [r for r in rows if r.mode == mode]
+        if candidates:
+            selected.append(min(candidates, key=lambda r: r.expected_ns_per_token))
+    static = [r for r in rows if r.mode == "SpecFACE-static-gamma" and not r.fallback]
+    if static:
+        selected.append(min(static, key=lambda r: r.expected_ns_per_token))
+    return selected
+
+
+def workload_variant_specs(exp_cfg: Dict,
+                           base_prompt: int,
+                           base_output: int,
+                           base_context: int) -> List[Dict[str, object]]:
+    variants = exp_cfg.get("workload_variants")
+    if variants:
+        return variants
+    return [
+        {
+            "name": "trace_mixed",
+            "prompt_tokens": base_prompt,
+            "output_tokens": base_output,
+            "context_tokens": base_context,
+        },
+        {
+            "name": "short_prompt",
+            "prompt_tokens": 256,
+            "output_tokens": 64,
+            "context_tokens": 256,
+        },
+        {
+            "name": "long_prompt",
+            "prompt_tokens": 2048,
+            "output_tokens": 64,
+            "context_tokens": 2048,
+        },
+        {
+            "name": "long_decode",
+            "prompt_tokens": 512,
+            "output_tokens": 256,
+            "context_tokens": 512,
+        },
+        {
+            "name": "balanced_long",
+            "prompt_tokens": 1024,
+            "output_tokens": 128,
+            "context_tokens": 1024,
+        },
+    ]
+
+
+def estimate_e2e_ns(mapping: MappingResult,
+                    face: MappingResult,
+                    output_tokens: int) -> float:
+    if mapping.mode == "FACE" or mapping.fallback:
+        return face.prefill_ns + output_tokens * face.expected_ns_per_token
+    rounds = math.ceil(output_tokens / max(1e-9, mapping.expected_committed))
+    return mapping.prefill_ns + rounds * mapping.pipeline_round_ns
+
+
+def run_workload_variants(hw: Hardware,
+                          target: Model,
+                          draft: Model,
+                          params: SpecParams,
+                          variants: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for variant in variants:
+        name = str(variant["name"])
+        prompt_tokens = int(variant["prompt_tokens"])
+        output_tokens = int(variant["output_tokens"])
+        context_tokens = int(variant.get("context_tokens", prompt_tokens))
+        alpha = float(variant.get("alpha", params.default_alpha))
+        face = face_row(hw, target, params, alpha, prompt_tokens, context_tokens)
+        spec, _ = dynamic_gamma("SpecFACE-full", hw, target, draft, params,
+                                alpha, prompt_tokens, context_tokens,
+                                journal=True,
+                                fallback_allowed=params.fallback_enabled)
+        face_e2e = estimate_e2e_ns(face, face, output_tokens)
+        spec_e2e = estimate_e2e_ns(spec, face, output_tokens)
+        rows.append({
+            "workload": name,
+            "alpha": f"{alpha:.4f}",
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "context_tokens": context_tokens,
+            "gamma": spec.gamma,
+            "fallback": int(spec.fallback),
+            "face_ns_per_token": f"{face.expected_ns_per_token:.3f}",
+            "specface_ns_per_token": f"{spec.expected_ns_per_token:.3f}",
+            "tpot_speedup": f"{face.expected_ns_per_token / max(1e-9, spec.expected_ns_per_token):.6f}",
+            "face_e2e_ns": f"{face_e2e:.3f}",
+            "specface_e2e_ns": f"{spec_e2e:.3f}",
+            "e2e_speedup": f"{face_e2e / max(1e-9, spec_e2e):.6f}",
+            "target_prefill_cores": spec.partition.target_prefill,
+            "target_verify_cores": spec.partition.target_verify,
+            "draft_prefill_cores": spec.partition.draft_prefill,
+            "draft_decode_cores": spec.partition.draft_decode,
+            "bottleneck": spec.bottleneck,
+        })
+    return rows
+
+
+def make_plots(summary: Sequence[MappingResult],
+               workload_rows: Sequence[Dict[str, object]],
+               default_alpha: float,
+               plot_dir: Path) -> List[Path]:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+
+    selected = select_default_workflow_rows(summary, default_alpha)
+    spec_selected = [r for r in selected if r.mode != "FACE"]
+    colors = {
+        "target_prefill": "#2b6cb0",
+        "target_verify": "#63b3ed",
+        "draft_prefill": "#2f855a",
+        "draft_decode": "#9ae6b4",
+        "target_compute": "#2b6cb0",
+        "draft_compute": "#2f855a",
+        "hbm": "#c05621",
+        "sram": "#805ad5",
+        "noc": "#718096",
+    }
+
+    if spec_selected:
+        labels = [r.mode.replace("SpecFACE-", "") for r in spec_selected]
+        data = [
+            [r.partition.target_prefill for r in spec_selected],
+            [r.partition.target_verify for r in spec_selected],
+            [r.partition.draft_prefill for r in spec_selected],
+            [r.partition.draft_decode for r in spec_selected],
+        ]
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        bottom = [0] * len(labels)
+        names = ["target_prefill", "target_verify", "draft_prefill", "draft_decode"]
+        for name, values in zip(names, data):
+            ax.bar(labels, values, bottom=bottom, label=name, color=colors[name])
+            bottom = [a + b for a, b in zip(bottom, values)]
+        ax.set_ylabel("cores")
+        ax.set_title(f"SpecFACE workflow core partitions at alpha={default_alpha}")
+        ax.legend(ncol=2, fontsize=8)
+        ax.tick_params(axis="x", rotation=25)
+        fig.tight_layout()
+        path = plot_dir / "workflow_partitions.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        paths.append(path)
+
+    full_rows = [r for r in summary if r.mode == "SpecFACE-full"]
+    if full_rows:
+        full_rows = sorted(full_rows, key=lambda r: r.alpha)
+        x = [r.alpha for r in full_rows]
+        fig, ax = plt.subplots(figsize=(9, 4.8))
+        ax.plot(x, [r.target_internal_overlap for r in full_rows], marker="o", label="target internal")
+        ax.plot(x, [r.draft_internal_overlap for r in full_rows], marker="o", label="draft internal")
+        ax.plot(x, [r.cross_model_overlap for r in full_rows], marker="o", label="cross model")
+        ax.plot(x, [r.overall_overlap for r in full_rows], marker="o", label="overall")
+        ax.set_xlabel("acceptance rate alpha")
+        ax.set_ylabel("overlap ratio")
+        ax.set_ylim(0, 1)
+        ax.set_title("Online SpecFACE overlap by acceptance rate")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        path = plot_dir / "online_overlap.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        paths.append(path)
+
+    if selected:
+        labels = [r.mode.replace("SpecFACE-", "") for r in selected]
+        target_values = [r.target_compute_ns for r in selected]
+        draft_values = [r.draft_compute_ns for r in selected]
+        hbm_values = [r.memory_ns for r in selected]
+        sram_values = [r.journal_ns + r.journal_stall_ns for r in selected]
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        bottom = [0.0] * len(labels)
+        for name, values in [("target_compute", target_values),
+                             ("draft_compute", draft_values),
+                             ("hbm", hbm_values),
+                             ("sram", sram_values)]:
+            ax.bar(labels, values, bottom=bottom, label=name, color=colors[name])
+            bottom = [a + b for a, b in zip(bottom, values)]
+        ax.set_ylabel("ns per round/token component")
+        ax.set_title(f"Compute/HBM/SRAM resource time at alpha={default_alpha}")
+        ax.legend(ncol=2, fontsize=8)
+        ax.tick_params(axis="x", rotation=25)
+        fig.tight_layout()
+        path = plot_dir / "resource_breakdown.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        paths.append(path)
+
+    if workload_rows:
+        labels = [str(r["workload"]) for r in workload_rows]
+        tpot = [float(r["tpot_speedup"]) for r in workload_rows]
+        e2e = [float(r["e2e_speedup"]) for r in workload_rows]
+        xs = list(range(len(labels)))
+        width = 0.36
+        fig, ax = plt.subplots(figsize=(10, 4.8))
+        ax.bar([x - width / 2 for x in xs], tpot, width, label="TPOT speedup", color="#2b6cb0")
+        ax.bar([x + width / 2 for x in xs], e2e, width, label="E2E speedup", color="#c05621")
+        ax.axhline(1.0, color="#4a5568", linewidth=1.0)
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=20, ha="right")
+        ax.set_ylabel("speedup over FACE")
+        ax.set_title(f"SpecFACE speedup across workload classes at alpha={default_alpha}")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        path = plot_dir / "workload_speedup.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        paths.append(path)
+
+    return paths
+
 def write_markdown_summary(path: Path,
                            default_alpha: float,
                            summary: List[MappingResult],
-                           output_dir: Path) -> None:
+                           workload_rows: Sequence[Dict[str, object]],
+                           output_dir: Path,
+                           plot_dir: Path,
+                           plot_paths: Sequence[Path]) -> None:
     rows = [r for r in summary if abs(r.alpha - default_alpha) < 1e-9]
     rows.sort(key=lambda r: (r.mode, r.gamma))
     best = min((r for r in rows if r.mode.startswith("SpecFACE-full")),
@@ -758,11 +993,13 @@ def write_markdown_summary(path: Path,
     lines = [
         "# SpecFACE Micro Experiment 001",
         "",
-        "This is the first single-instance analytical experiment for SpecFACE. "
-        "It uses the lightweight OME search from `docs/images/SpecFACE_plan.md` "
-        "and the FACE WSC baseline configuration.",
+        "This single-instance analytical experiment uses the lightweight OME "
+        "search from `docs/images/SpecFACE_plan.md` and the FACE WSC baseline "
+        "configuration. It now emits plots for workflow partitioning, online "
+        "overlap, resource usage, and workload-class speedups.",
         "",
         f"Output directory: `{output_dir}`",
+        f"Plot directory: `{plot_dir}`",
         "",
         "## Default-alpha Snapshot",
         "",
@@ -777,6 +1014,27 @@ def write_markdown_summary(path: Path,
             f"| {r.mode} | {r.gamma} | {int(r.fallback)} | "
             f"{r.expected_ns_per_token:.1f} | {r.speedup_over_face:.3f} | "
             f"{part} | {r.bottleneck} |")
+
+    lines.extend(["", "## Figures", ""])
+    for plot in plot_paths:
+        rel = plot.relative_to(path.parent)
+        title = plot.stem.replace("_", " ").title()
+        lines.extend([f"### {title}", "", f"![{title}]({rel})", ""])
+
+    if workload_rows:
+        lines.extend([
+            "## Workload-Class Speedups",
+            "",
+            "| workload | prompt | output | context | gamma | fallback | TPOT speedup | E2E speedup | bottleneck |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ])
+        for r in workload_rows:
+            lines.append(
+                f"| {r['workload']} | {r['prompt_tokens']} | {r['output_tokens']} | "
+                f"{r['context_tokens']} | {r['gamma']} | {r['fallback']} | "
+                f"{float(r['tpot_speedup']):.3f} | {float(r['e2e_speedup']):.3f} | "
+                f"{r['bottleneck']} |")
+
     lines.extend(["", "## Notes", ""])
     if face and best:
         lines.append(
@@ -815,6 +1073,7 @@ def run(config_path: Path) -> None:
         raise RuntimeError(f"no requests loaded from {trace_path}")
 
     prompt_tokens = int(round(sum(r.input_tokens for r in requests) / len(requests)))
+    output_tokens = int(round(sum(r.output_tokens for r in requests) / len(requests)))
     context_tokens = int(exp_cfg.get("context_tokens", prompt_tokens))
 
     summary_results: List[MappingResult] = []
@@ -868,6 +1127,10 @@ def run(config_path: Path) -> None:
     write_csv(output_dir / "specface_summary.csv", summary_rows)
     write_csv(output_dir / "specface_gamma_sweep.csv", gamma_sweep_rows)
 
+    variants = workload_variant_specs(exp_cfg, prompt_tokens, output_tokens, context_tokens)
+    workload_rows = run_workload_variants(hw, target, draft, params, variants)
+    write_csv(output_dir / "specface_workload_summary.csv", workload_rows)
+
     default_dynamic = next(
         (r for r in summary_results
          if r.mode == "SpecFACE-full" and abs(r.alpha - params.default_alpha) < 1e-9),
@@ -886,13 +1149,21 @@ def run(config_path: Path) -> None:
         "summary_markdown",
         "../../../docs/images/SpecFACE_experiment_001.md",
     ))
-    write_markdown_summary(summary_doc, params.default_alpha, summary_results, output_dir)
+    plot_dir = resolve_path(cfg_dir, exp_cfg.get(
+        "plot_dir",
+        "../../../docs/images/specface_experiment_001",
+    ))
+    plot_paths = make_plots(summary_results, workload_rows, params.default_alpha, plot_dir)
+    write_markdown_summary(summary_doc, params.default_alpha, summary_results,
+                           workload_rows, output_dir, plot_dir, plot_paths)
 
     print(f"SpecFACE micro experiment complete")
     print(f"  config: {config_path}")
     print(f"  output_dir: {output_dir}")
     print(f"  summary: {output_dir / 'specface_summary.csv'}")
     print(f"  gamma_sweep: {output_dir / 'specface_gamma_sweep.csv'}")
+    print(f"  workload_summary: {output_dir / 'specface_workload_summary.csv'}")
+    print(f"  plots: {plot_dir}")
     print(f"  report: {summary_doc}")
 
 

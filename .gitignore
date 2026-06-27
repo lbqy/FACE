@@ -33,6 +33,7 @@ runs
 # Local toolchains and generated FACE outputs
 .conda-protoc/
 .venv-protoc/
+.venv-specface/
 .local/
 examples/llm_serving/face/outputs/
 core
