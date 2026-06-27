@@ -30,7 +30,6 @@
       0.95
     ],
     "gamma_candidates": [
-      1,
       2,
       3,
       4,
@@ -40,8 +39,8 @@
       16
     ],
     "static_gammas": [
-      1,
       2,
+      3,
       4,
       8,
       12,
@@ -106,5 +105,7 @@
     2,
     4
   ],
-  "cores_per_core_group": 16
+  "cores_per_core_group": 16,
+  "transaction_timeline_requests": 6,
+  "face_decode_chunk_tokens": 8
 }

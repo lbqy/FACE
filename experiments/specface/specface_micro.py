@@ -213,12 +213,24 @@ def parse_model(cfg: Dict, name: str = "model") -> Model:
     )
 
 
+def parse_gamma_list(spec: Dict, key: str, default: Sequence[int]) -> List[int]:
+    # gamma=1 is a degenerate one-token lookahead. Keep SD search focused
+    # on batched verification points where speculative decoding is meaningful.
+    values = spec.get(key, default)
+    cleaned: List[int] = []
+    for value in values:
+        gamma = int(value)
+        if gamma >= 2 and gamma not in cleaned:
+            cleaned.append(gamma)
+    return cleaned or [int(v) for v in default if int(v) >= 2]
+
+
 def parse_params(exp_cfg: Dict) -> SpecParams:
     spec = exp_cfg.get("speculative", {})
     return SpecParams(
         alphas=spec.get("alphas", [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]),
-        gamma_candidates=spec.get("gamma_candidates", [1, 2, 3, 4, 6, 8, 12, 16]),
-        static_gammas=spec.get("static_gammas", [1, 2, 4, 8, 12, 16]),
+        gamma_candidates=parse_gamma_list(spec, "gamma_candidates", [2, 3, 4, 6, 8, 12, 16]),
+        static_gammas=parse_gamma_list(spec, "static_gammas", [2, 3, 4, 8, 12, 16]),
         default_alpha=float(spec.get("acceptance_rate", 0.8)),
         dynamic_gamma=bool(spec.get("dynamic_gamma", True)),
         fallback_enabled=bool(spec.get("fallback_enabled", True)),
@@ -429,16 +441,37 @@ def fixed_partition(hw: Hardware, params: SpecParams) -> Partition:
     ], hw, params.core_group_granularity)
 
 
-def face_decode_cost(hw: Hardware, target: Model, params: SpecParams, context_tokens: int) -> float:
+def face_partition(hw: Hardware, params: SpecParams) -> Partition:
+    gran = max(1, params.core_group_granularity)
+    total = hw.core_group_count
+    face_prefill_fraction = float(params.fixed_partition.get(
+        "face_target_prefill", params.fixed_partition.get("target_prefill", 0.40)))
+    prefill = round_up_to_granularity(total * face_prefill_fraction, gran, gran)
+    prefill = min(total - gran, max(gran, prefill))
+    decode = total - prefill
+    return Partition(prefill, decode, 0, 0)
+
+
+def face_decode_cost(hw: Hardware,
+                     target: Model,
+                     params: SpecParams,
+                     context_tokens: int,
+                     decode_groups: Optional[int] = None) -> float:
+    cores = hw.core_count if decode_groups is None else groups_to_cores(decode_groups, hw)
     ops = decode_ops(target, 1, context_tokens)
-    comp = compute_ns(ops, hw.core_count, hw, params.target_decode_eff)
+    comp = compute_ns(ops, cores, hw, params.target_decode_eff)
     mem = hbm_ns(decode_bytes(target, 1, context_tokens), hw, params)
     noc = noc_ns(decode_bytes(target, 1, context_tokens) * params.noc_traffic_fraction, hw)
     return max(comp, mem, noc)
 
 
-def face_prefill_cost(hw: Hardware, target: Model, params: SpecParams, prompt_tokens: int) -> float:
-    comp = compute_ns(prefill_ops(target, prompt_tokens), hw.core_count, hw, params.target_prefill_eff)
+def face_prefill_cost(hw: Hardware,
+                      target: Model,
+                      params: SpecParams,
+                      prompt_tokens: int,
+                      prefill_groups: Optional[int] = None) -> float:
+    cores = hw.core_count if prefill_groups is None else groups_to_cores(prefill_groups, hw)
+    comp = compute_ns(prefill_ops(target, prompt_tokens), cores, hw, params.target_prefill_eff)
     mem = hbm_ns(prefill_bytes(target, prompt_tokens), hw, params)
     noc = noc_ns(prefill_bytes(target, prompt_tokens) * params.noc_traffic_fraction, hw)
     return max(comp, mem, noc)
@@ -458,7 +491,8 @@ def evaluate_partition(mode: str,
                        fallback_allowed: bool) -> MappingResult:
     e_acc = expected_accepted(alpha, gamma)
     e_commit = expected_committed(alpha, gamma)
-    face_cost = face_decode_cost(hw, target, params, context_tokens)
+    face_part = face_partition(hw, params)
+    face_cost = face_decode_cost(hw, target, params, context_tokens, face_part.target_verify)
 
     tp_compute = compute_ns(prefill_ops(target, prompt_tokens), groups_to_cores(part.target_prefill, hw), hw,
                             params.target_prefill_eff)
@@ -650,16 +684,17 @@ def face_row(hw: Hardware,
              alpha: float,
              prompt_tokens: int,
              context_tokens: int) -> MappingResult:
+    part = face_partition(hw, params)
     decode_hbm_bytes = decode_bytes(target, 1, context_tokens)
-    comp = compute_ns(decode_ops(target, 1, context_tokens), hw.core_count, hw,
+    comp = compute_ns(decode_ops(target, 1, context_tokens),
+                      groups_to_cores(part.target_verify, hw), hw,
                       params.target_decode_eff)
     mem = hbm_ns(decode_hbm_bytes, hw, params)
     noc = noc_ns(decode_hbm_bytes * params.noc_traffic_fraction, hw)
     face = max(comp, mem, noc)
-    prefill = face_prefill_cost(hw, target, params, prompt_tokens)
+    prefill = face_prefill_cost(hw, target, params, prompt_tokens, part.target_prefill)
     bottleneck_values = {"compute": comp, "hbm": mem, "noc": noc}
     bottleneck = max(bottleneck_values, key=bottleneck_values.get)
-    part = Partition(hw.core_group_count, 0, 0, 0)
     return MappingResult(
         mode="FACE",
         alpha=alpha,
@@ -739,6 +774,208 @@ def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def add_transaction_event(events: List[Dict[str, object]],
+                          result: MappingResult,
+                          req: Request,
+                          round_id: int,
+                          lane: str,
+                          name: str,
+                          start: float,
+                          end: float,
+                          color: str,
+                          tokens: float = 0.0) -> None:
+    if end <= start:
+        return
+    events.append({
+        "mode": workflow_label(result),
+        "request_id": req.request_id,
+        "round_id": round_id,
+        "lane": lane,
+        "name": name,
+        "start_ns": start,
+        "end_ns": end,
+        "duration_ns": end - start,
+        "tokens": tokens,
+        "color": color,
+    })
+
+
+def reserve_transaction_phase(events: List[Dict[str, object]],
+                              resources: Dict[str, float],
+                              result: MappingResult,
+                              req: Request,
+                              round_id: int,
+                              earliest: float,
+                              specs: Sequence[Tuple[str, str, str, float, str, float]]) -> float:
+    active = [(lane, key, name, float(duration), color, float(tokens))
+              for lane, key, name, duration, color, tokens in specs
+              if duration > 0.0]
+    if not active:
+        return earliest
+    start = max([earliest] + [resources.get(key, 0.0) for _, key, _, _, _, _ in active])
+    phase_end = start
+    for lane, key, name, duration, color, tokens in active:
+        end = start + duration
+        resources[key] = end
+        phase_end = max(phase_end, end)
+        add_transaction_event(events, result, req, round_id, lane, name,
+                              start, end, color, tokens)
+    return phase_end
+
+
+def simulate_transactions(requests: Sequence[Request],
+                          mapping: MappingResult,
+                          face: MappingResult,
+                          hw: Hardware,
+                          target: Model,
+                          draft: Model,
+                          params: SpecParams,
+                          max_requests: int,
+                          face_decode_chunk_tokens: int) -> List[Dict[str, object]]:
+    events: List[Dict[str, object]] = []
+    resources: Dict[str, float] = {}
+    selected = sorted(requests, key=lambda r: (r.arrival_time_ns, r.request_id))[:max_requests]
+    use_face = mapping.mode == "FACE" or mapping.fallback
+    active = face if use_face else mapping
+
+    for req in selected:
+        t = float(req.arrival_time_ns)
+        if use_face:
+            part = face.partition
+            prefill_bytes_target = prefill_bytes(target, req.input_tokens)
+            tp_compute = compute_ns(prefill_ops(target, req.input_tokens),
+                                    groups_to_cores(part.target_prefill, hw), hw,
+                                    params.target_prefill_eff)
+            tp_hbm = hbm_ns(prefill_bytes_target, hw, params)
+            tp_noc = noc_ns(prefill_bytes_target * params.noc_traffic_fraction, hw)
+            t = reserve_transaction_phase(events, resources, active, req, -1, t, [
+                ("target prefill", f"{active.mode}:target_prefill", "target prefill",
+                 tp_compute, "target_prefill", 0.0),
+                ("HBM", f"{active.mode}:hbm", "prefill weights/KV",
+                 tp_hbm, "hbm", 0.0),
+                ("NoC", f"{active.mode}:noc", "prefill data move",
+                 tp_noc, "noc", 0.0),
+            ])
+
+            remaining = req.output_tokens
+            round_id = 0
+            chunk = max(1, face_decode_chunk_tokens)
+            while remaining > 0:
+                step = min(chunk, remaining)
+                context = req.input_tokens + (req.output_tokens - remaining)
+                decode_bytes_target = decode_bytes(target, step, context)
+                td_compute = compute_ns(decode_ops(target, step, context),
+                                        groups_to_cores(part.target_verify, hw), hw,
+                                        params.target_decode_eff)
+                td_hbm = hbm_ns(decode_bytes_target, hw, params)
+                td_noc = noc_ns(decode_bytes_target * params.noc_traffic_fraction, hw)
+                t = reserve_transaction_phase(events, resources, active, req, round_id, t, [
+                    ("target decode", f"{active.mode}:target_decode", f"target decode x{step}",
+                     td_compute, "target_verify", float(step)),
+                    ("HBM", f"{active.mode}:hbm", "decode KV read/write",
+                     td_hbm, "hbm", 0.0),
+                    ("NoC", f"{active.mode}:noc", "decode data move",
+                     td_noc, "noc", 0.0),
+                ])
+                remaining -= step
+                round_id += 1
+            continue
+
+        part = mapping.partition
+        target_prefill_bytes = prefill_bytes(target, req.input_tokens)
+        draft_prefill_bytes = prefill_bytes(draft, req.input_tokens)
+        tp_end = reserve_transaction_phase(events, resources, mapping, req, -1, t, [
+            ("target prefill", f"{mapping.mode}:target_prefill", "target prefill",
+             compute_ns(prefill_ops(target, req.input_tokens),
+                        groups_to_cores(part.target_prefill, hw), hw,
+                        params.target_prefill_eff), "target_prefill", 0.0),
+            ("HBM", f"{mapping.mode}:hbm", "target prefill weights/KV",
+             hbm_ns(target_prefill_bytes, hw, params), "hbm", 0.0),
+            ("NoC", f"{mapping.mode}:noc", "target prefill data move",
+             noc_ns(target_prefill_bytes * params.noc_traffic_fraction, hw), "noc", 0.0),
+        ])
+        dp_end = reserve_transaction_phase(events, resources, mapping, req, -1, t, [
+            ("draft prefill", f"{mapping.mode}:draft_prefill", "draft prefill",
+             compute_ns(prefill_ops(draft, req.input_tokens),
+                        groups_to_cores(part.draft_prefill, hw), hw,
+                        params.draft_prefill_eff), "draft_prefill", 0.0),
+            ("HBM", f"{mapping.mode}:hbm", "draft prefill weights/KV",
+             hbm_ns(draft_prefill_bytes, hw, params), "hbm", 0.0),
+            ("NoC", f"{mapping.mode}:noc", "draft prefill data move",
+             noc_ns(draft_prefill_bytes * params.noc_traffic_fraction, hw), "noc", 0.0),
+        ])
+
+        t = max(tp_end, dp_end)
+        committed = 0.0
+        round_id = 0
+        gamma = max(2, mapping.gamma)
+        while committed < req.output_tokens - 1e-9:
+            context = int(req.input_tokens + committed)
+            dd_bytes = decode_bytes(draft, gamma, context)
+            sram_bw = max(1.0, part.draft_decode * hw.sram_bw_bytes_per_group_ns)
+            journal_duration = (gamma * draft.kv_bytes_per_token / sram_bw
+                                if mapping.journal else 0.0)
+            dd_end = reserve_transaction_phase(events, resources, mapping, req, round_id, t, [
+                ("draft decode", f"{mapping.mode}:draft_decode", f"draft decode g={gamma}",
+                 compute_ns(decode_ops(draft, gamma, context),
+                            groups_to_cores(part.draft_decode, hw), hw,
+                            params.draft_decode_eff), "draft_decode", float(gamma)),
+                ("HBM", f"{mapping.mode}:hbm", "draft decode KV read",
+                 hbm_ns(dd_bytes, hw, params), "hbm", 0.0),
+                ("SRAM", f"{mapping.mode}:sram", "journal write",
+                 journal_duration, "sram", 0.0),
+            ])
+
+            tv_bytes = verify_bytes(target, gamma, context)
+            tv_end = reserve_transaction_phase(events, resources, mapping, req, round_id, dd_end, [
+                ("target verify", f"{mapping.mode}:target_verify", f"target verify g={gamma}",
+                 compute_ns(verify_ops(target, gamma, context),
+                            groups_to_cores(part.target_verify, hw), hw,
+                            params.target_verify_eff), "target_verify", mapping.expected_committed),
+                ("HBM", f"{mapping.mode}:hbm", "verify KV read/write",
+                 hbm_ns(tv_bytes, hw, params), "hbm", 0.0),
+                ("NoC", f"{mapping.mode}:noc", "verify broadcast/reduce",
+                 noc_ns(tv_bytes * params.noc_traffic_fraction, hw), "noc", 0.0),
+            ])
+
+            commit_hbm_bytes = mapping.expected_accepted * draft.kv_bytes_per_token if mapping.journal else 0.0
+            commit_sram_bytes = max(0.0, gamma - mapping.expected_accepted) * draft.kv_bytes_per_token
+            commit_end = reserve_transaction_phase(events, resources, mapping, req, round_id, tv_end, [
+                ("KV commit/free", f"{mapping.mode}:commit", "KV commit/free",
+                 max(hbm_ns(commit_hbm_bytes, hw, params), commit_sram_bytes / sram_bw),
+                 "sram", mapping.expected_committed),
+                ("HBM", f"{mapping.mode}:hbm", "accepted draft KV commit",
+                 hbm_ns(commit_hbm_bytes, hw, params), "hbm", 0.0),
+                ("SRAM", f"{mapping.mode}:sram", "rejected journal free",
+                 commit_sram_bytes / sram_bw, "sram", 0.0),
+            ])
+
+            sync_bytes = decode_bytes(draft, 1, int(context + mapping.expected_committed))
+            t = reserve_transaction_phase(events, resources, mapping, req, round_id, commit_end, [
+                ("draft sync", f"{mapping.mode}:draft_decode", "draft sync",
+                 compute_ns(sync_ops(draft, context, mapping.expected_committed),
+                            groups_to_cores(part.draft_decode, hw), hw,
+                            params.draft_decode_eff), "draft_prefill", 1.0),
+                ("HBM", f"{mapping.mode}:hbm", "sync KV read/write",
+                 hbm_ns(sync_bytes, hw, params), "hbm", 0.0),
+                ("NoC", f"{mapping.mode}:noc", "sync data move",
+                 noc_ns(sync_bytes * params.noc_traffic_fraction, hw), "noc", 0.0),
+            ])
+            committed += max(1e-9, mapping.expected_committed)
+            round_id += 1
+    return events
+
+
+def write_transaction_csv(path: Path, events: Sequence[Dict[str, object]]) -> None:
+    rows: List[Dict[str, object]] = []
+    for event in events:
+        row = dict(event)
+        for key in ["start_ns", "end_ns", "duration_ns", "tokens"]:
+            row[key] = f"{float(row[key]):.3f}"
+        rows.append(row)
+    write_csv(path, rows)
 
 
 def summarize_requests(requests: Sequence[Request],
@@ -884,6 +1121,7 @@ def run_workload_variants(hw: Hardware,
 
 def make_plots(summary: Sequence[MappingResult],
                workload_rows: Sequence[Dict[str, object]],
+               transaction_events: Sequence[Dict[str, object]],
                default_alpha: float,
                plot_dir: Path,
                hw: Hardware) -> List[Path]:
@@ -910,7 +1148,7 @@ def make_plots(summary: Sequence[MappingResult],
 
     if selected:
         paths.append(draw_mapping_layouts(selected, plot_dir, colors, hw))
-        paths.append(draw_workflow_timelines(selected, plot_dir, colors))
+        paths.append(draw_workflow_timelines(transaction_events, plot_dir, colors))
 
     if spec_selected:
         labels = [r.mode.replace("SpecFACE-", "") for r in spec_selected]
@@ -1058,11 +1296,13 @@ def core_group_assignments(result: MappingResult, hw: Hardware) -> List[Dict[str
             if remaining <= 0:
                 return
 
+    top_first = sorted(cells, key=lambda c: (c["global_r"], c["global_c"]))
+    bottom_first = sorted(cells, key=lambda c: (-c["global_r"], c["global_c"]))
+
     if result.mode == "FACE":
-        take(cells, hw.core_group_count, "target decode")
+        take(top_first, result.partition.target_prefill, "target prefill")
+        take(bottom_first, result.partition.target_verify, "target decode")
     else:
-        top_first = sorted(cells, key=lambda c: (c["global_r"], c["global_c"]))
-        bottom_first = sorted(cells, key=lambda c: (-c["global_r"], c["global_c"]))
         take(top_first, result.partition.target_prefill, "target prefill")
         take(bottom_first, result.partition.draft_prefill, "draft prefill/sync")
         middle_left = sorted(cells, key=lambda c: (c["global_c"], c["global_r"]))
@@ -1196,7 +1436,7 @@ def draw_mapping_layouts(selected: Sequence[MappingResult], plot_dir: Path,
         part = result.partition
         ax.set_title(
             f"{workflow_label(result)} | g={result.gamma} | speedup={result.speedup_over_face:.2f}x\n"
-            f"TP/TV/DP/DD={part.target_prefill}/{part.target_verify}/"
+            f"TP/TD-or-TV/DP/DD={part.target_prefill}/{part.target_verify}/"
             f"{part.draft_prefill}/{part.draft_decode} groups",
             fontsize=9,
         )
@@ -1241,71 +1481,98 @@ def draw_mapping_layouts(selected: Sequence[MappingResult], plot_dir: Path,
     return path
 
 
-def draw_workflow_timelines(selected: Sequence[MappingResult], plot_dir: Path,
+def draw_workflow_timelines(transaction_events: Sequence[Dict[str, object]],
+                            plot_dir: Path,
                             colors: Dict[str, str]) -> Path:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
 
-    fig, ax = plt.subplots(figsize=(13.5, max(4.2, 0.85 * len(selected) + 1.6)))
-    lane_offsets = {
-        "Target": 0.24,
-        "Draft": 0.08,
-        "HBM": -0.08,
-        "SRAM": -0.24,
-        "NoC": -0.36,
-    }
-    lane_height = 0.13
-    scale = 1000.0
-    y_positions = {workflow_label(result): idx for idx, result in enumerate(reversed(selected))}
-    max_end = 1.0
+    if not transaction_events:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.set_axis_off()
+        path = plot_dir / "workflow_timelines.png"
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return path
 
-    for result in selected:
-        label = workflow_label(result)
-        base_y = y_positions[label]
-        for event in timeline_events(result):
-            start_us = float(event["start_ns"]) / scale
-            duration_us = float(event["duration_ns"]) / scale
-            max_end = max(max_end, start_us + duration_us)
+    preferred_modes = ["FACE", "full", "fixed-partition", "no-journal",
+                       "no-fallback", "static-g2", "static-g3", "static-g4"]
+    modes_seen = []
+    for mode in preferred_modes:
+        if any(str(e["mode"]) == mode for e in transaction_events):
+            modes_seen.append(mode)
+    for event in transaction_events:
+        mode = str(event["mode"])
+        if mode not in modes_seen:
+            modes_seen.append(mode)
+    modes = modes_seen[:4]
+
+    lane_order = [
+        "target prefill",
+        "target decode",
+        "draft prefill",
+        "draft decode",
+        "target verify",
+        "KV commit/free",
+        "draft sync",
+        "HBM",
+        "SRAM",
+        "NoC",
+    ]
+    fig, axes = plt.subplots(len(modes), 1,
+                             figsize=(14, max(3.4, 2.7 * len(modes))),
+                             sharex=True)
+    if len(modes) == 1:
+        axes = [axes]
+
+    global_max = max(float(e["end_ns"]) for e in transaction_events) / 1000.0
+    for ax, mode in zip(axes, modes):
+        mode_events = [e for e in transaction_events if str(e["mode"]) == mode]
+        lanes = [lane for lane in lane_order
+                 if any(str(e["lane"]) == lane for e in mode_events)]
+        lane_y = {lane: idx for idx, lane in enumerate(reversed(lanes))}
+        for event in mode_events:
             lane = str(event["lane"])
-            y = base_y + lane_offsets.get(lane, 0.0)
-            rect = patches.Rectangle((start_us, y - lane_height / 2),
-                                     duration_us, lane_height,
-                                     facecolor=colors[str(event["color"])],
-                                     edgecolor="#1f2937", linewidth=0.6,
-                                     alpha=0.9)
+            if lane not in lane_y:
+                continue
+            start_us = float(event["start_ns"]) / 1000.0
+            duration_us = float(event["duration_ns"]) / 1000.0
+            y = lane_y[lane]
+            rect = patches.Rectangle((start_us, y - 0.34), duration_us, 0.68,
+                                     facecolor=colors.get(str(event["color"]), "#718096"),
+                                     edgecolor="#1f2937", linewidth=0.35,
+                                     alpha=0.86)
             ax.add_patch(rect)
-            if duration_us > max_end * 0.06:
-                ax.text(start_us + duration_us / 2, y, str(event["name"]),
-                        ha="center", va="center", fontsize=7)
-        ax.text(max_end * 0.01, base_y + 0.38,
-                f"gamma={result.gamma}, fallback={int(result.fallback)}, bottleneck={result.bottleneck}",
-                fontsize=7, color="#4a5568")
+            if duration_us > max(1.0, global_max * 0.08):
+                ax.text(start_us + duration_us / 2, y,
+                        f"r{event['request_id']} {event['name']}",
+                        ha="center", va="center", fontsize=6)
+        ax.set_yticks([lane_y[lane] for lane in lanes])
+        ax.set_yticklabels(lanes)
+        ax.set_ylim(-0.75, max(0, len(lanes) - 0.25))
+        ax.set_xlim(0, global_max * 1.03)
+        ax.grid(axis="x", alpha=0.22)
+        ax.set_title(f"{mode}: transaction-level workflow/resource timeline", fontsize=10)
 
-    labels = [workflow_label(r) for r in reversed(selected)]
-    ax.set_yticks(range(len(labels)))
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("time (us)")
-    ax.set_ylabel("workflow")
-    ax.set_xlim(0, max_end * 1.05)
-    ax.set_ylim(-0.75, len(selected) - 0.25)
-    ax.grid(axis="x", alpha=0.25)
+    axes[-1].set_xlabel("time (us)")
     legend_items = [
-        ("Target", "target_verify"),
-        ("Draft", "draft_decode"),
+        ("target prefill", "target_prefill"),
+        ("target decode/verify", "target_verify"),
+        ("draft prefill/sync", "draft_prefill"),
+        ("draft decode", "draft_decode"),
         ("HBM", "hbm"),
         ("SRAM", "sram"),
         ("NoC", "noc"),
     ]
     handles = [patches.Patch(color=colors[color], label=label)
                for label, color in legend_items]
-    ax.legend(handles=handles, ncol=5, loc="upper right", fontsize=8)
-    ax.set_title("Workflow execution over time (one row per workflow)")
-    fig.tight_layout()
+    fig.legend(handles=handles, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 0.995), fontsize=8)
+    fig.suptitle("Request transaction timelines over the input trace", fontsize=14, y=1.02)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     path = plot_dir / "workflow_timelines.png"
-    fig.savefig(path, dpi=180)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     return path
-
 
 def write_markdown_summary(path: Path,
                            default_alpha: float,
@@ -1334,8 +1601,9 @@ def write_markdown_summary(path: Path,
         f"`{hw.cores_per_group}` cores per group.",
         "",
         "The mapping figure renders one cell per core group. The timeline "
-        "figure uses time on the x-axis and one row per workflow so pipeline "
-        "busy/idle behavior is visible directly.",
+        "figure is generated from request-level transaction events over the "
+        "input trace; each panel uses time on the x-axis and workflow/resource "
+        "lanes on the y-axis so pipeline busy/idle behavior is visible directly.",
         "",
         f"Output directory: `{output_dir}`",
         f"Plot directory: `{plot_dir}`",
@@ -1344,7 +1612,7 @@ def write_markdown_summary(path: Path,
         "",
         f"Default acceptance rate: `{default_alpha}`",
         "",
-        "| mode | gamma | fallback | ns/token | speedup vs FACE | partition TP/TV/DP/DD (groups) | bottleneck |",
+        "| mode | gamma | fallback | ns/token | speedup vs FACE | partition TP/TD-or-TV/DP/DD (groups) | bottleneck |",
         "|---|---:|---:|---:|---:|---|---|",
     ]
     for r in rows:
@@ -1390,6 +1658,11 @@ def write_markdown_summary(path: Path,
         "`specface_core_group_mapping.csv` contains one row per workflow/core-group "
         "cell with die coordinates, group coordinates, assigned workflow, and "
         "cores per group.")
+    lines.append(
+        "`specface_transaction_events.csv` is the transaction-level trace used by "
+        "the timeline plot; it records request id, round id, workflow/resource lane, "
+        "and start/end time for prefill, decode/verify, commit/free, HBM, SRAM, "
+        "and NoC events.")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n")
 
@@ -1499,9 +1772,19 @@ def run(config_path: Path) -> None:
     selected_default = select_default_workflow_rows(summary_results, params.default_alpha)
     core_group_mapping_path = output_dir / "specface_core_group_mapping.csv"
     write_layout_csv(core_group_mapping_path, selected_default, hw)
+    max_timeline_requests = int(exp_cfg.get("transaction_timeline_requests", len(requests)))
+    face_decode_chunk_tokens = int(exp_cfg.get("face_decode_chunk_tokens", 8))
+    transaction_events: List[Dict[str, object]] = []
+    for selected in selected_default:
+        transaction_events.extend(simulate_transactions(
+            requests, selected, default_face if default_face is not None else selected,
+            hw, target, draft, params, max_timeline_requests, face_decode_chunk_tokens))
+    transaction_events_path = output_dir / "specface_transaction_events.csv"
+    write_transaction_csv(transaction_events_path, transaction_events)
     write_timeline_csv(output_dir / "specface_timeline_events.csv", selected_default)
 
-    plot_paths = make_plots(summary_results, workload_rows, params.default_alpha, plot_dir, hw)
+    plot_paths = make_plots(summary_results, workload_rows, transaction_events,
+                            params.default_alpha, plot_dir, hw)
     write_markdown_summary(summary_doc, params.default_alpha, summary_results,
                            workload_rows, hw, output_dir, plot_dir, plot_paths)
 
@@ -1512,7 +1795,8 @@ def run(config_path: Path) -> None:
     print(f"  gamma_sweep: {output_dir / 'specface_gamma_sweep.csv'}")
     print(f"  workload_summary: {output_dir / 'specface_workload_summary.csv'}")
     print(f"  core_group_mapping: {core_group_mapping_path}")
-    print(f"  timeline_events: {output_dir / 'specface_timeline_events.csv'}")
+    print(f"  transaction_events: {transaction_events_path}")
+    print(f"  representative_timeline_events: {output_dir / 'specface_timeline_events.csv'}")
     print(f"  plots: {plot_dir}")
     print(f"  report: {summary_doc}")
 

@@ -12,7 +12,7 @@
 - 单个 request 内保持 SD 依赖顺序；通过多 cohort 并发挖掘 target 内部、draft 内部、target-draft 之间的 overlap。
 - draft speculative KV 优先写入 SRAM journal，verify 后只将 accepted prefix 推入 HBM，rejected suffix 直接释放。
 
-当前 FACE baseline 可用参数来自 `examples/llm_serving/face/face_wsc_config.json`：4x4 die array、每 die 16x16 cores、每 core 0.75 MB SRAM、每 core 740 GFLOP/s、每 die 4 个 HBM chiplets、每 HBM 410 GB/s、D2D 6.67 TB/s。SpecFACE 第一阶段固定为单 instance 内探索，可把 `shape = 4x4` 或其他单 instance shape 作为输入参数，不做跨 instance 调度。
+当前 FACE baseline 的 HBM、SRAM、compute、NoC 参数仍来自 `examples/llm_serving/face/face_wsc_config.json`，但本实验的单 instance 拓扑按 core-group 粒度建模：`2x2` dies，每个 die 有 `2x4` core groups，总计 `32` core groups，每个 group 内 `16` cores。SpecFACE 第一阶段固定为单 instance 内探索，OME 搜索变量是 workflow 需要多少 core groups，而不是直接枚举裸 core 数；跨 instance 调度留作后续。
 
 ## 1. 执行流与状态机
 
@@ -195,34 +195,34 @@ Ops_draft_sync(N) ~= L_d * [12 * H_d^2 + 2 * (N + E[R]) * H_d]
 
 它可以与其他 cohort 的 target verify 或 target prefill overlap。
 
-## 4. Core 级资源分配搜索
+## 4. Core-group 级资源分配搜索
 
 ### 4.1 搜索变量
 
-单 instance 总 core 数为：
+单 instance 总 core group 数为：
 
 ```text
-C = die_rows * die_cols * core_rows * core_cols
+G = die_rows * die_cols * group_rows_per_die * group_cols_per_die
 ```
 
-将 core 分配给四个主要 compute pools：
+将 core groups 分配给四个主要 compute pools：
 
 ```text
-c_TP: target prefill cores
-c_TV: target verify cores
-c_DP: draft prefill cores
-c_DD: draft decode/sync cores
+g_TP: target prefill core groups
+g_TV: target verify core groups
+g_DP: draft prefill core groups
+g_DD: draft decode/sync core groups
 ```
 
 约束为：
 
 ```text
-c_TP + c_TV + c_DP + c_DD <= C - c_reserved
-c_i >= c_i_min
-c_i mod g == 0
+g_TP + g_TV + g_DP + g_DD <= G - g_reserved
+g_i >= g_i_min
+g_i mod granularity == 0
 ```
 
-其中 `g` 是搜索粒度，例如 8/16/32 cores。`KVCommitFree` 默认不分配 core，只消耗 memory/copy timeline；如果后续发现 metadata/copy 成为瓶颈，可加入 `c_KV` 或 DMA lane 数。
+其中 `granularity` 是 core-group 搜索粒度，例如 1/2/4 groups。`KVCommitFree` 默认不分配 core group，只消耗 memory/copy timeline；如果后续发现 metadata/copy 成为瓶颈，可加入 `g_KV` 或 DMA lane 数。
 
 ### 4.2 轻量搜索方法
 
@@ -239,26 +239,26 @@ A_DD = Ops_draft_decode(gamma, N) + Ops_draft_sync(N)
 
 2. 生成三个 seed partition：
 
-延迟优化 seed，适合单 cohort 总时延近似 `sum A_i/c_i`：
+延迟优化 seed，适合单 cohort 总时延近似 `sum A_i/g_i`：
 
 ```text
-c_i ∝ sqrt(A_i)
+g_i ∝ sqrt(A_i)
 ```
 
-流水吞吐 seed，适合多 cohort pipeline 近似 `max A_i/c_i`：
+流水吞吐 seed，适合多 cohort pipeline 近似 `max A_i/g_i`：
 
 ```text
-c_i ∝ A_i
+g_i ∝ A_i
 ```
 
 FACE 继承 seed，保留 target-heavy 设计：
 
 ```text
-c_TP + c_TV ~= 70%~85% C
-c_DP + c_DD ~= 15%~30% C
+g_TP + g_TV ~= 70%~85% G
+g_DP + g_DD ~= 15%~30% G
 ```
 
-3. 将 seed snap 到 `g` 的整数倍，满足 `c_i_min`。
+3. 将 seed snap 到 `granularity` 的整数倍，满足 `g_i_min`。
 
 4. 在每个 seed 附近做 bounded local search：
 
@@ -287,7 +287,7 @@ JournalPressure = max(0, JournalBytesNeeded / JournalCapacity - 1)
 HBMPressure = max(0, HBMBytesNeeded / HBMCapacity - 1)
 ```
 
-这个搜索空间很小：若 `C=4096`、`g=64`，全量枚举四元组也只有万级；局部枚举更轻，可以 runtime 触发。
+这个搜索空间很小：若 `G=32`、`granularity=1`，全量枚举四元组也很小；局部枚举更轻，可以 runtime 触发。
 
 ### 4.3 启发式 core layout
 
@@ -408,10 +408,10 @@ alpha_hat[bucket(prompt_len, context_len, temperature)]
 候选集合：
 
 ```text
-GammaCandidates = {1, 2, 3, 4, 6, 8, 12, 16}
+GammaCandidates = {2, 3, 4, 6, 8, 12, 16}
 ```
 
-对每个 `gamma` 估算：
+对每个 `gamma` 估算。`gamma=1` 只作为 one-token lookahead 的退化 sanity point，不进入有效 SpecFACE OME 搜索；如果所有 `gamma >= 2` 都无收益，应返回 `gamma=0` fallback 到 FACE。
 
 ```text
 E_R = (1 - alpha_hat^(gamma + 1)) / (1 - alpha_hat)
@@ -443,7 +443,7 @@ gamma* = argmin Score(gamma)
 
 ```pseudo
 procedure CHOOSE_GAMMA(alpha_hat, state):
-    best_gamma <- 1
+    best_gamma <- 0
     best_score <- INF
 
     for gamma in GammaCandidates:
@@ -556,7 +556,7 @@ JournalBytes = gamma * KV_draft_per_token
 sum_active JournalBytes <= C_DD * S_core * journal_fraction
 ```
 
-其中 `C_DD` 是 draft decode island core 数，`S_core` 是每 core SRAM，`journal_fraction` 默认 0.25~0.5 扫参。
+其中 `G_DD` 是 draft decode island core group 数，`S_group` 是每 core group 可用 SRAM，`journal_fraction` 默认 0.25~0.5 扫参。
 
 ### 8.2 Commit/free 行为
 
@@ -660,7 +660,7 @@ procedure OME_MAP(active_cohorts, state):
   "enabled": true,
   "acceptance_rate": 0.8,
   "acceptance_ewma_rho": 0.9,
-  "gamma_candidates": [1, 2, 3, 4, 6, 8, 12, 16],
+  "gamma_candidates": [2, 3, 4, 6, 8, 12, 16],
   "gamma_max": 16,
   "dynamic_gamma": true,
   "fallback_enabled": true,
@@ -715,7 +715,7 @@ alpha in {0.50, 0.60, 0.70, 0.80, 0.90, 0.95}
 Gamma：
 
 ```text
-gamma_static in {1, 2, 4, 8, 12, 16}
+gamma_static in {2, 3, 4, 8, 12, 16}
 ```
 
 Draft model 尺寸：
