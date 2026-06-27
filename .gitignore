@@ -29,3 +29,11 @@ build/astra_htsim/build/
 
 # runs
 runs
+
+# Local toolchains and generated FACE outputs
+.conda-protoc/
+.venv-protoc/
+.local/
+examples/llm_serving/face/outputs/
+core
+core.*

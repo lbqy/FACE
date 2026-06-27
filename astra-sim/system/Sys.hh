@@ -73,7 +73,8 @@ class Sys : public Callable {
         std::vector<int> queues_per_dim,
         double injection_scale,
         double comm_scale,
-        bool rendezvous_enabled);
+        bool rendezvous_enabled,
+        bool create_workload = true);
     ~Sys();
     //---------------------------------------------------------------------------
 

@@ -51,6 +51,7 @@ endif()
 file(GLOB srcs
     "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/system/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/workload/*.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/llm/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/system/astraccl/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/system/astraccl/native_collectives/*.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/astra-sim/system/astraccl/native_collectives/logical_topology/*.cc"
@@ -101,3 +102,13 @@ set_target_properties(AstraSim
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../lib/
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../lib/
 )
+
+
+option(ASTRA_SIM_BUILD_FACE_TESTS "Build FACE LLM serving unit tests" OFF)
+if(ASTRA_SIM_BUILD_FACE_TESTS)
+    add_executable(FaceUnitTests tests/face/FaceUnitTests.cc)
+    target_link_libraries(FaceUnitTests PRIVATE AstraSim)
+    target_include_directories(FaceUnitTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(FaceUnitTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/../bin/)
+endif()

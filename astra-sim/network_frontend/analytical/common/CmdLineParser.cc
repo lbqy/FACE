@@ -18,7 +18,7 @@ CmdLineParser::CmdLineParser(const char* const argv0) noexcept
 void CmdLineParser::define_options() noexcept {
     options.set_width(70).allow_unrecognised_options().add_options()(
         "workload-configuration", "Workload configuration file",
-        cxxopts::value<std::string>())(
+        cxxopts::value<std::string>()->default_value("empty"))(
         "comm-group-configuration", "Communicator group configuration fi`le",
         cxxopts::value<std::string>()->default_value("empty"))(
         "system-configuration", "System configuration file",
@@ -31,6 +31,10 @@ void CmdLineParser::define_options() noexcept {
         cxxopts::value<std::string>()->default_value("empty"))(
         "logging-folder", "Logging folder",
         cxxopts::value<std::string>()->default_value("log"))(
+        "workload-mode", "Workload mode: chakra or llm-serving",
+        cxxopts::value<std::string>()->default_value("chakra"))(
+        "llm-server-configuration", "LLM server configuration file",
+        cxxopts::value<std::string>()->default_value("empty"))(
         "num-queues-per-dim", "Number of queues per each dimension",
         cxxopts::value<int>()->default_value("1"))(
         "compute-scale", "Compute scale",

@@ -1,0 +1,35 @@
+{
+  "hardware": {
+    "die_array": [4, 4],
+    "hbm_chiplets_per_die": 4,
+    "dram_capacity_gb_per_hbm": 16,
+    "dram_bandwidth_gbps_per_hbm": 410,
+    "d2d_bandwidth_tbps": 6.67,
+    "core_sram_mb": 0.75,
+    "core_compute_gflops": 740,
+    "noc_width_bits": 512,
+    "core_array": [16, 16]
+  },
+  "model": {
+    "name": "LLaMA2-7B-like",
+    "num_layers": 32,
+    "hidden_size": 4096,
+    "num_heads": 32,
+    "num_kv_heads": 32,
+    "head_dim": 128,
+    "weight_bytes": 14000000000,
+    "kv_bytes_per_token": 524288
+  },
+  "workload": {
+    "request_trace": "requests.csv",
+    "output_dir": "outputs",
+    "prefill_chunk_tokens": 512
+  },
+  "cse": {
+    "decode_batch_sizes": [1, 2, 4, 8],
+    "decode_token_counts": [256, 512, 1024, 2048],
+    "prefill_tile_candidates": [128, 256, 512],
+    "decode_tile_candidates": [16, 32, 64, 128]
+  },
+  "scheduler": "face"
+}

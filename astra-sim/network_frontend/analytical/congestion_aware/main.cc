@@ -4,12 +4,15 @@ LICENSE file in the root directory of this source tree.
 *******************************************************************************/
 
 #include "astra-sim/common/Logging.hh"
+#include "astra-sim/llm/FaceServerCoordinator.hh"
 #include "common/CmdLineParser.hh"
 #include "congestion_aware/CongestionAwareNetworkApi.hh"
 #include <astra-network-analytical/common/EventQueue.h>
 #include <astra-network-analytical/common/NetworkParser.h>
 #include <astra-network-analytical/congestion_aware/Helper.h>
 #include <remote_memory_backend/analytical/AnalyticalRemoteMemory.hh>
+#include <memory>
+#include <stdexcept>
 
 using namespace AstraSim;
 using namespace Analytical;
@@ -44,6 +47,19 @@ int main(int argc, char* argv[]) {
     const auto injection_scale = cmd_line_parser.get<double>("injection-scale");
     const auto rendezvous_protocol =
         cmd_line_parser.get<bool>("rendezvous-protocol");
+    const auto workload_mode =
+        cmd_line_parser.get<std::string>("workload-mode");
+    const auto llm_server_configuration =
+        cmd_line_parser.get<std::string>("llm-server-configuration");
+    const auto create_chakra_workload = workload_mode != "llm-serving";
+    if (workload_mode != "chakra" && workload_mode != "llm-serving") {
+        throw std::runtime_error("Unsupported workload-mode: " + workload_mode);
+    }
+    if (workload_mode == "llm-serving" &&
+        llm_server_configuration == "empty") {
+        throw std::runtime_error(
+            "--llm-server-configuration is required for llm-serving mode");
+    }
 
     AstraSim::LoggerFactory::init(logging_configuration, logging_folder);
 
@@ -83,7 +99,7 @@ int main(int argc, char* argv[]) {
             new Sys(i, workload_configuration, comm_group_configuration,
                     system_configuration, memory_api.get(), network_api.get(),
                     npus_count_per_dim, queues_per_dim, injection_scale,
-                    comm_scale, rendezvous_protocol);
+                    comm_scale, rendezvous_protocol, create_chakra_workload);
 
         // push back network and system
         network_apis.push_back(std::move(network_api));
@@ -91,8 +107,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Initiate ASTRA-sim simulation
-    for (int i = 0; i < npus_count; i++) {
-        systems[i]->workload->fire();
+    std::unique_ptr<FaceServerCoordinator> face_coordinator;
+    if (workload_mode == "llm-serving") {
+        face_coordinator = std::make_unique<FaceServerCoordinator>(
+            systems, llm_server_configuration);
+        face_coordinator->start();
+    } else {
+        for (int i = 0; i < npus_count; i++) {
+            systems[i]->workload->fire();
+        }
     }
 
     // run simulation
