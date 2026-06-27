@@ -37,3 +37,10 @@ runs
 examples/llm_serving/face/outputs/
 core
 core.*
+
+# Generated SpecFACE micro-experiment outputs
+examples/llm_serving/specface/outputs/
+
+# Python cache
+__pycache__/
+*.pyc

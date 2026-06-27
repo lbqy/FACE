@@ -1,0 +1,46 @@
+{
+  "base_config": "../face/face_wsc_config.json",
+  "request_trace": "../face/requests.csv",
+  "output_dir": "outputs",
+  "summary_markdown": "../../../docs/images/SpecFACE_experiment_001.md",
+  "instance_shape": [4, 4],
+  "context_tokens": 747,
+  "sram_bw_bytes_per_core_ns": 4096,
+  "draft_model": {
+    "name": "draft-llm-0.125x",
+    "num_layers": 8,
+    "hidden_size": 2048,
+    "num_heads": 16,
+    "num_kv_heads": 16,
+    "head_dim": 128,
+    "weight_bytes": 1500000000,
+    "kv_bytes_per_token": 131072
+  },
+  "speculative": {
+    "acceptance_rate": 0.8,
+    "alphas": [0.5, 0.6, 0.7, 0.8, 0.9, 0.95],
+    "gamma_candidates": [1, 2, 3, 4, 6, 8, 12, 16],
+    "static_gammas": [1, 2, 4, 8, 12, 16],
+    "dynamic_gamma": true,
+    "fallback_enabled": true,
+    "fallback_min_speedup": 1.05,
+    "fallback_alpha_min": 0.6,
+    "core_granularity": 64,
+    "journal_sram_fraction": 0.35,
+    "active_cohorts": 4,
+    "safety_factor": 0.85,
+    "target_prefill_eff": 0.72,
+    "target_verify_eff": 0.62,
+    "target_decode_eff": 0.60,
+    "draft_prefill_eff": 0.74,
+    "draft_decode_eff": 0.68,
+    "hbm_efficiency": 0.82,
+    "noc_traffic_fraction": 0.12,
+    "fixed_partition": {
+      "target_prefill": 0.40,
+      "target_verify": 0.28,
+      "draft_prefill": 0.12,
+      "draft_decode": 0.20
+    }
+  }
+}
